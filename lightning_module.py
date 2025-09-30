@@ -54,9 +54,10 @@ class TranslationGFNTask(LightningModule):
         n_samples = self.hparams.n_samples if n_samples is None else n_samples
         reward_fn = partial(
             self.reward.score,
-            prompt_length=prompt["input_ids"].shape[1],
+            prompt_length=2,  # For seq2seq: skip decoder prefix (EOS + target_lang_id)
             model=self.model,
             tokenizer=self.tokenizer,
+            ground_truth_target=prompt[1] if len(prompt) > 1 else None,
         )
         (
             generated_text,
@@ -66,7 +67,7 @@ class TranslationGFNTask(LightningModule):
             log_r_unpenalized,
         ) = generate_and_return_termination_logprob(
             self.model,
-            prompt,
+            prompt[0].to(self.device), 
             reward_fn=reward_fn,
             termination_token_id=self.end_of_sentence_token_id,
             vocab_naughty_mask=self.hparams.illegal_token_mask,
@@ -80,23 +81,28 @@ class TranslationGFNTask(LightningModule):
         return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
 
     def training_step(self, prompt, batch_idx):
-        # Should always be (1, prompt_len)
-        prompt = prompt[0][0]
+        # prompt is a tuple: (source_encoded, target_string)
+        # Extract source for buffer operations and ground truth for reward
+        source_prompt = prompt[0][0]  # Source encoded input
+        ground_truth = prompt[1]  # Target string for BLEU/chrF++ reward
+        
+        # Keep full prompt tuple for forward() which expects (source, target)
+        full_prompt = (source_prompt, ground_truth)
 
         # Sample a sentence and get the reward
         if (
             random.random() < self.hparams.use_buffer_prob
-            and self.reward_buffer.sample(self.hparams.n_samples, prompt)[0] is not None
+            and self.reward_buffer.sample(self.hparams.n_samples, source_prompt)[0] is not None
         ):
             # Using a sample from the reward buffer
             action_seq, log_r = self.reward_buffer.sample(
-                self.hparams.n_samples, prompt
+                self.hparams.n_samples, source_prompt
             )
             generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                prompt, action_seq=action_seq
+                full_prompt, action_seq=action_seq
             )
             log_r = log_r[
-                :, : generated_text.shape[1] - len(prompt)
+                :, : generated_text.shape[1] - 2  # Decoder prefix length (EOS + tgt_lang_id)
             ]  # Undo padding from buffer
             log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
         else:
@@ -108,13 +114,13 @@ class TranslationGFNTask(LightningModule):
                     + self.hparams.pf_temp_low
                 )
             else:  # Without tempering
-                pf_temp = 1.0
+                pf_temp = 0.3
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt, pf_temperature=pf_temp
+                full_prompt, pf_temperature=pf_temp
             )
             self.reward_buffer.add_batch(
-                prompt=prompt,
-                sentences=generated_text[:, len(prompt) :],
+                prompt=source_prompt,
+                sentences=generated_text[:, 2:],  # Skip decoder prefix (EOS + tgt_lang_id)
                 logrewards=log_r
                 * self.reward.temperature,  # undo the effect of reward tempering
                 tokenizer=self.tokenizer,
@@ -127,7 +133,7 @@ class TranslationGFNTask(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
             subtb_lambda=self.hparams.subtb_lambda,
         )
 
@@ -139,7 +145,7 @@ class TranslationGFNTask(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -197,12 +203,14 @@ class TranslationGFNTask(LightningModule):
         return loss
 
     def validation_step(self, prompt, batch_idx):
-        # Should always be (1, prompt_len)
-        prompt = prompt[0][0]
+        # prompt is a tuple: (source_encoded, target_string)
+        source_prompt = prompt[0][0]
+        ground_truth = prompt[1]
+        full_prompt = (source_prompt, ground_truth)
 
         # Sample a sentence and get the reward
         generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-            prompt
+            full_prompt
         )
 
         # Get the GFN loss
@@ -212,7 +220,7 @@ class TranslationGFNTask(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
             subtb_lambda=self.hparams.subtb_lambda,
         )
 
@@ -224,7 +232,7 @@ class TranslationGFNTask(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -266,7 +274,7 @@ class TranslationGFNTask(LightningModule):
         )
         if self.diversity_metric.method is not None:
             generated_sentences = self.tokenizer.batch_decode(
-                generated_text[:, len(prompt) :]
+                generated_text[:, 2:]  # Skip decoder prefix (EOS + tgt_lang_id)
             )
             generated_sentences = [
                 text.replace(".", "") for text in generated_sentences
@@ -301,9 +309,8 @@ class TranslationGFNTask(LightningModule):
         log_rs, log_pfss = [], []
         val_data = self.trainer.datamodule.val_dataloader().dataset
         for prompt in val_data:
-            prompt = prompt[0]
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt.to(self.device), pf_temperature=2.0
+                prompt, pf_temperature=0.3
             )
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
@@ -476,28 +483,16 @@ class TranslationGFNTask(LightningModule):
                     **kwargs,
                 )
                 self.model.train()
-                log_r, log_r_unpenalized = self.reward.score(
-                    generated_text,
-                    prompt_length=prompt.shape[1],
-                    model=self.model,
-                    tokenizer=self.tokenizer,
+                # TODO: Baseline reward computation disabled - requires ground_truth_target
+                # For now, just compute sentence length without rewards
+                sentence_len = (
+                    (generated_text[:, prompt.shape[1]:] == self.end_of_sentence_token_id)
+                    .byte()
+                    .argmax(dim=-1)
                 )
-                (
-                    _,
-                    last_log_r,
-                    last_log_r_unpenalized,
-                    sentence_len,
-                ) = get_termination_vals(
-                    generated_text=generated_text,
-                    log_pf=None,
-                    log_pterm=None,
-                    log_r=log_r,
-                    log_r_unpenalized=log_r_unpenalized,
-                    termination_token_id=self.end_of_sentence_token_id,
-                    prompt_len=prompt.shape[1],
-                )
-                log_ps = last_log_r * self.reward.temperature
-                log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+                # Set dummy rewards (zeros) for baselines
+                log_ps = torch.zeros(generated_text.shape[0], device=generated_text.device)
+                log_ps_unpenalized = torch.zeros(generated_text.shape[0], device=generated_text.device)
 
             generated_text = generated_text[:, prompt.shape[1] :]
             generated_text = torch.where(

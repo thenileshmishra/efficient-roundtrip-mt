@@ -3,55 +3,41 @@ import heapq
 import pickle
 import gzip
 import editdistance
-import spacy
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
+import sacrebleu
 
 @torch.no_grad()
 def score_fast(
-    model,
     encoded_input,
     termination_token_id,
     min_len,
     skip_first,
-    vocab_nice_mask=None,
-    vocab_naughty_mask=None,
-    vocab_alpha=-99,
-    prompt_cache=None,
+    ground_truth_target,
+    tokenizer,
+    bleu_weight=0.5,
+    chrf_weight=0.5,
 ):
-    if prompt_cache is None:
-        logits = model(encoded_input).logits
-    else:
-        # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
-        batched_prompt_cache = tuple(
-            tuple(
-                [
-                    prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1)
-                    for j in range(len(prompt_cache[1][i]))
-                ]
-            )
-            for i in range(len(prompt_cache[1]))
-        )
-        logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
-    # get rid of the first few tokens
-    logits = logits[:, skip_first - 1 :]
-    # score the log probability of the input sequence while ignoring termination and padding tokens
-    if vocab_nice_mask is not None:
-        # add vocab_alpha to the logits of the unmasked vocab items
-        logits[:, :, ~vocab_nice_mask] += vocab_alpha
-    elif vocab_naughty_mask is not None:
-        # add vocab_alpha to the logits of the masked vocab items
-        logits[:, :, vocab_naughty_mask] += vocab_alpha
-    logprob = logits.log_softmax(-1)
-    token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
-    logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
-    logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
-    reward = logprob[
-        :, :, termination_token_id
-    ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
-    reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
+    """
+    Compute BLEU and chrF++ rewards for generated sequences in machine translation.
+    
+    Args:
+        encoded_input: Tokenized input sequences (batch_size, seq_len)
+        termination_token_id: ID of the termination token
+        min_len: Minimum sequence length before termination
+        skip_first: Number of initial tokens to skip (prompt length)
+        ground_truth_target: Reference translation string (required)
+        tokenizer: Tokenizer for decoding sequences (required)
+        bleu_weight: Weight for BLEU score in combined reward (default: 0.5)
+        chrf_weight: Weight for chrF++ score in combined reward (default: 0.5)
+    
+    Returns:
+        reward: Position-wise rewards (with min_len penalty)
+        reward_unpenalized: Position-wise rewards (without min_len penalty)
+    """
+    # Create mask for non-terminated positions
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
     non_term_mask = torch.cat(
         (
@@ -60,9 +46,51 @@ def score_fast(
         ),
         dim=-1,
     )  # Start (i.e., empty) state has never terminated
-    reward[~non_term_mask] = 0.0
+    
+    # Compute BLEU and chrF++ rewards for machine translation
+    batch_size = encoded_input.shape[0]
+    seq_len = non_term_mask.shape[1]
+    reward = torch.zeros(batch_size, seq_len, device=encoded_input.device)
+    
+    # Compute rewards for each sample in the batch
+    for b in range(batch_size):
+        # For each position, compute BLEU and chrF++ for the partial sequence
+        for pos in range(seq_len):
+            if not non_term_mask[b, pos]:
+                # Already terminated, reward is 0
+                continue
+            
+            # Get the partial generated sequence up to position pos
+            # Position 0 is empty (just prompt), positions 1+ have generated tokens
+            if pos == 0:
+                # Empty generation, give small baseline score
+                reward[b, pos] = -10.0
+            else:
+                # Decode the generated tokens up to this position
+                generated_tokens = encoded_input[b, skip_first:skip_first + pos]
+                hypothesis = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                
+                # Compute BLEU score
+                bleu = sacrebleu.sentence_bleu(hypothesis, [ground_truth_target], smooth_method='exp')
+                bleu_score = bleu.score / 100.0  # Normalize to [0, 1]
+                
+                # Compute chrF++ score  
+                chrf = chrf = sacrebleu.sentence_chrf(hypothesis, [ground_truth_target], word_order=2)
+
+                chrf_score = chrf.score / 100.0  # Normalize to [0, 1]
+                
+                # Combined reward (weighted average)
+                combined_score = bleu_weight * bleu_score + chrf_weight * chrf_score
+                
+                # Convert to log-space reward (to match original scale)
+                # Use log(score + epsilon) to avoid log(0)
+                reward[b, pos] = torch.log(torch.tensor(combined_score + 1e-8, device=encoded_input.device))
+    
     reward_unpenalized = reward.clone()
+    
+    # Apply minimum length penalty
     reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -99, reward)
+    
     return reward, reward_unpenalized
 
 
@@ -72,11 +100,10 @@ class FrozenModelSentenceGivenPrompt:
         sentence_token_id,
         temperature=1.0,
         min_len=1,
-        vocab_alpha=-50.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
         sentence_validator=None,
         valid_sentence_alpha=None,
+        bleu_weight=0.5,
+        chrf_weight=0.5,
     ):
         assert (
             sentence_validator is None
@@ -87,30 +114,26 @@ class FrozenModelSentenceGivenPrompt:
 
         self.temperature = temperature
         self.sentence_token_id = sentence_token_id
-        self.vocab_nice_mask = vocab_nice_mask
-        self.vocab_naughty_mask = vocab_naughty_mask
-        self.vocab_alpha = vocab_alpha
         self.min_len = min_len
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
+        self.bleu_weight = bleu_weight
+        self.chrf_weight = chrf_weight
 
-    def score(self, input_batch, prompt_length, model, tokenizer):
-        training = model.training
-        model.eval()
+    def score(self, input_batch, prompt_length, model, tokenizer, ground_truth_target=None):
+        # Note: model parameter kept for compatibility but not used in score_fast anymore
         reward, reward_unpenalized = score_fast(
-            model=model,
             encoded_input=input_batch,
             termination_token_id=self.sentence_token_id,
             skip_first=prompt_length,
-            vocab_nice_mask=self.vocab_nice_mask,
-            vocab_naughty_mask=self.vocab_naughty_mask,
-            vocab_alpha=self.vocab_alpha,
             min_len=self.min_len,
+            ground_truth_target=ground_truth_target,
+            tokenizer=tokenizer,
+            bleu_weight=self.bleu_weight,
+            chrf_weight=self.chrf_weight,
         )
         reward /= self.temperature
         reward_unpenalized /= self.temperature
-        if training:
-            model.train()
 
         if self.sentence_validator is not None:
             invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)

@@ -11,8 +11,8 @@ model:
 
 training:
   subtb_lambda: 1.0
-  pf_temp_high: 2.0
-  pf_temp_low: 0.5
+  pf_temp_high: 0.4
+  pf_temp_low: 0.2
   pf_temp_prob: 0.666
   use_buffer_prob: 0.25
   n_samples: 2
@@ -32,6 +32,9 @@ reward:
   vocab_alpha: -50
   sentence_validator: null
   buffer_size: 50
+  # MT reward settings (BLEU and chrF++)
+  bleu_weight: 0.5  # Weight for BLEU score
+  chrf_weight: 0.5  # Weight for chrF++ score
 
 callbacks:
   - _target_: pytorch_lightning.callbacks.ModelCheckpoint

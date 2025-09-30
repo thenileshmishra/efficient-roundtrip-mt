@@ -113,10 +113,10 @@ def get_reward(config: DictConfig, sentence_token_id, illegal_token_mask):
     reward = FrozenModelSentenceGivenPrompt(
         sentence_token_id=sentence_token_id,
         min_len=config.task.constraints.min_sentence_len,
-        vocab_alpha=config.task.reward.vocab_alpha,
-        vocab_naughty_mask=illegal_token_mask,
         sentence_validator=sentence_validator,
         valid_sentence_alpha=valid_sentence_alpha,
+        bleu_weight=config.task.reward.get("bleu_weight", 0.5),
+        chrf_weight=config.task.reward.get("chrf_weight", 0.5),
     )
 
     return reward
