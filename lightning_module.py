@@ -1,593 +1,180 @@
-import random
-from functools import partial
-import pandas as pd
-import numpy as np
 import torch
+import copy
 from pytorch_lightning import LightningModule
-from utils import (
-    generate_and_return_termination_logprob,
-    modified_subtb_loss,
-    get_termination_vals,
-    SequenceDiversity,
-)
 
-class TranslationGFNTask(LightningModule):
+
+class TranslationGRPOTask(LightningModule):
     def __init__(
         self,
         model,
         tokenizer,
-        reward,
-        reward_buffer,
-        n_samples,
         lr,
-        subtb_lambda,
-        pf_temp_high,
-        pf_temp_low,
-        pf_temp_prob,
-        use_buffer_prob,
-        min_sentence_len,
-        max_sentence_len,
-        reward_temp_start,
-        reward_temp_end,
-        reward_temp_horizon,
-        illegal_token_mask,
-        train_probes=None,
-        val_probes=None,
+        num_return_sequences=8,
+        max_new_tokens=128,
+        gen_temperature=0.9,
+        beta=0.04,
+        clip_param=0.2,
         tgt_lang_id=None,
+        reference_model_name: str = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "tokenizer"])
+        self.save_hyperparameters(ignore=["model", "tokenizer"]) 
 
         self.model = model
         self.tokenizer = tokenizer
-        self.reward = reward
-        self.reward_buffer = reward_buffer
-        self.tgt_lang_id = tgt_lang_id
-        self.get_lr_at_step = lambda step: min(step / 20 * lr, lr)
-        self.get_reward_temp_at_step = lambda step: reward_temp_start + (
-            reward_temp_end - reward_temp_start
-        ) * min(1, step / reward_temp_horizon)
-
         self.end_of_sentence_token_id = tokenizer.eos_token_id
+        self.tgt_lang_id = tgt_lang_id
 
-    def forward(self, prompt, n_samples=None, pf_temperature=1.0, action_seq=None):
-        n_samples = self.hparams.n_samples if n_samples is None else n_samples
-        reward_fn = partial(
-            self.reward.score,
-            prompt_length=2,  # For seq2seq: skip decoder prefix (EOS + target_lang_id)
-            model=self.model,
-            tokenizer=self.tokenizer,
-            ground_truth_target=prompt[1] if len(prompt) > 1 else None,
-        )
-        (
-            generated_text,
-            log_pf,
-            log_pterm,
-            log_r,
-            log_r_unpenalized,
-        ) = generate_and_return_termination_logprob(
-            self.model,
-            prompt[0].to(self.device), 
-            reward_fn=reward_fn,
-            termination_token_id=self.end_of_sentence_token_id,
-            vocab_naughty_mask=self.hparams.illegal_token_mask,
-            min_len=self.hparams.min_sentence_len,
-            max_len=self.hparams.max_sentence_len,
-            temperature=pf_temperature,
-            skip_rewards=False,
-            action_seq=action_seq,
-            tgt_lang_id=self.tgt_lang_id,
-        )
-        return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
-
-    def training_step(self, prompt, batch_idx):
-        # prompt is a tuple: (source_encoded, target_string)
-        # Extract source for buffer operations and ground truth for reward
-        source_prompt = prompt[0][0]  # Source encoded input
-        ground_truth = prompt[1]  # Target string for BLEU/chrF++ reward
-        
-        # Keep full prompt tuple for forward() which expects (source, target)
-        full_prompt = (source_prompt, ground_truth)
-
-        # Sample a sentence and get the reward
-        if (
-            random.random() < self.hparams.use_buffer_prob
-            and self.reward_buffer.sample(self.hparams.n_samples, source_prompt)[0] is not None
-        ):
-            # Using a sample from the reward buffer
-            action_seq, log_r = self.reward_buffer.sample(
-                self.hparams.n_samples, source_prompt
-            )
-            generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                full_prompt, action_seq=action_seq
-            )
-            log_r = log_r[
-                :, : generated_text.shape[1] - 2  # Decoder prefix length (EOS + tgt_lang_id)
-            ]  # Undo padding from buffer
-            log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
+        # Reference policy (frozen)
+        if reference_model_name is not None:
+            from transformers import AutoModelForSeq2SeqLM
+            self.ref_model = AutoModelForSeq2SeqLM.from_pretrained(
+                reference_model_name,
+                attn_implementation="flash_attention_2",
+                torch_dtype=getattr(self.model, "dtype", None),
+            ).to(self.model.device if self.model.device is not None else self.device)
         else:
-            # Using the forward policy
-            if random.random() < self.hparams.pf_temp_prob:  # With tempering
-                pf_temp = (
-                    random.random()
-                    * (self.hparams.pf_temp_high - self.hparams.pf_temp_low)
-                    + self.hparams.pf_temp_low
-                )
-            else:  # Without tempering
-                pf_temp = 0.3
-            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                full_prompt, pf_temperature=pf_temp
-            )
-            self.reward_buffer.add_batch(
-                prompt=source_prompt,
-                sentences=generated_text[:, 2:],  # Skip decoder prefix (EOS + tgt_lang_id)
-                logrewards=log_r
-                * self.reward.temperature,  # undo the effect of reward tempering
-                tokenizer=self.tokenizer,
-            )
+            # Default to a frozen copy of current model's initial weights (loaded freshly)
+            self.ref_model = None
 
-        # Get the GFN loss
-        loss = modified_subtb_loss(
-            log_pf=log_pf,
-            log_r=log_r,
-            log_pterm=log_pterm,
-            generated_text=generated_text,
-            termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
-            subtb_lambda=self.hparams.subtb_lambda,
-        )
+        # Lazily freeze ref model in setup() after devices are set
+        self._ref_initialized = False
 
-        # Log metrics
-        _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
-            generated_text=generated_text,
-            log_pf=log_pf,
-            log_pterm=log_pterm,
-            log_r=log_r,
-            log_r_unpenalized=log_r_unpenalized,
-            termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
-        )
-        log_ps = last_log_r * self.reward.temperature
-        log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
-        self.log(
-            "train/loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            prog_bar=True,
-        )
-        self.log(
-            "train/logR",
-            last_log_r.mean(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/logP(s) (avg)",
-            log_ps.mean(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/logP(s) (max)",
-            log_ps.max(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/logP(s) unpenalized (avg)",
-            log_ps_unpenalized.mean(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/logP(s) unpenalized (max)",
-            log_ps_unpenalized.max(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/sentence_len",
-            sentence_len.float().mean(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-
-        return loss
-
-    def validation_step(self, prompt, batch_idx):
-        # prompt is a tuple: (source_encoded, target_string)
-        source_prompt = prompt[0][0]
-        ground_truth = prompt[1]
-        full_prompt = (source_prompt, ground_truth)
-
-        # Sample a sentence and get the reward
-        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-            full_prompt
-        )
-
-        # Get the GFN loss
-        loss = modified_subtb_loss(
-            log_pf=log_pf,
-            log_r=log_r,
-            log_pterm=log_pterm,
-            generated_text=generated_text,
-            termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
-            subtb_lambda=self.hparams.subtb_lambda,
-        )
-
-        # Log metrics
-        _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
-            generated_text=generated_text,
-            log_pf=log_pf,
-            log_pterm=log_pterm,
-            log_r=log_r,
-            log_r_unpenalized=log_r_unpenalized,
-            termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=2,  # Decoder prefix length (EOS + tgt_lang_id)
-        )
-        log_ps = last_log_r * self.reward.temperature
-        log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
-        self.log(
-            "val/loss",
-            loss,
-            sync_dist=True,
-            prog_bar=True,
-        )
-        self.log(
-            "val/logR",
-            last_log_r.mean(),
-            sync_dist=True,
-        )
-        self.log(
-            "val/logP(s) (avg)",
-            log_ps.mean(),
-            sync_dist=True,
-        )
-        self.log(
-            "val/logP(s) (max)",
-            log_ps.max(),
-            sync_dist=True,
-        )
-        self.log(
-            "val/logP(s) unpenalized (avg)",
-            log_ps_unpenalized.mean(),
-            sync_dist=True,
-        )
-        self.log(
-            "val/logP(s) unpenalized (max)",
-            log_ps_unpenalized.max(),
-            sync_dist=True,
-        )
-        self.log(
-            "val/sentence_len",
-            sentence_len.float().mean(),
-            sync_dist=True,
-        )
-        if self.diversity_metric.method is not None:
-            generated_sentences = self.tokenizer.batch_decode(
-                generated_text[:, 2:]  # Skip decoder prefix (EOS + tgt_lang_id)
-            )
-            generated_sentences = [
-                text.replace(".", "") for text in generated_sentences
-            ]
-            diversity = self.diversity_metric(generated_sentences)
-            self.log(f"val/{self.diversity_metric_name}", diversity, sync_dist=True)
-
-    def on_train_batch_start(self, prompt, batch_idx):
-        # Update scheduled quantities
-        reward_temp = self.get_reward_temp_at_step(self.global_step)
-        lr = self.get_lr_at_step(self.global_step)
-        self.reward.temperature = reward_temp
-        for pg in self.optimizers().param_groups:
-            pg["lr"] = lr
-
-    def on_train_epoch_start(self):
-        # Log scheduled quantities
-        self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
-        self.log("scheduled/lr", self.get_lr_at_step(self.global_step), sync_dist=True)
-
-        # Log probe samples
-        if (
-            self.hparams.train_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 5 == 0
-        ):
-            samples_table = self.sample_probes(self.hparams.train_probes)
-            self.logger.log_table("samples/train_probes", dataframe=samples_table)
-
-    def on_validation_epoch_start(self):
-        # Log variance of (logR - logP(s)) using exploration, which should be 0.0
-        log_rs, log_pfss = [], []
-        val_data = self.trainer.datamodule.val_dataloader().dataset
-        for prompt in val_data:
-            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt, pf_temperature=0.3
-            )
-            log_pfs, log_r, _, _ = get_termination_vals(
-                generated_text=generated_text,
-                log_pf=log_pf,
-                log_pterm=log_pterm,
-                log_r=log_r,
-                log_r_unpenalized=log_r_unpenalized,
-                termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(prompt),
-            )
-            log_rs.append(log_r)
-            log_pfss.append(log_pfs)
-        log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
-        self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
-
-        # Log probe samples
-        if (
-            self.hparams.val_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 5 == 0
-        ):
-            samples_table = self.sample_probes(self.hparams.val_probes)
-            self.logger.log_table("samples/val_probes", dataframe=samples_table)
-
-    def on_train_start(self):
-        # Log baseline metrics
-        val_data = self.trainer.datamodule.val_dataloader().dataset
-        baseline_performance = None
-        for prompt in val_data:
-            prompt = prompt[0]
-            samples = self.sample_baselines(
-                prompt.to(self.device), n_samples=self.hparams.n_samples
-            )
-            if baseline_performance is None:
-                baseline_performance = pd.DataFrame(
-                    data=np.zeros((6, len(samples))),
-                    columns=samples.keys(),
-                    index=[
-                        "logP(s) (avg)",
-                        "logP(s) (max)",
-                        "logP(s) unpenalized (avg)",
-                        "logP(s) unpenalized (max)",
-                        self.diversity_metric_name,
-                        "sentence length",
-                    ],
-                )
-            for baseline in samples:
-                baseline_performance.loc["logP(s) (avg)", baseline] += samples[
-                    baseline
-                ]["logP(s)"].mean().item() / len(val_data)
-                baseline_performance.loc["logP(s) (max)", baseline] += samples[
-                    baseline
-                ]["logP(s)"].max().item() / len(val_data)
-                baseline_performance.loc[
-                    "logP(s) unpenalized (avg)", baseline
-                ] += samples[baseline]["logP(s) unpenalized"].mean().item() / len(
-                    val_data
-                )
-                baseline_performance.loc[
-                    "logP(s) unpenalized (max)", baseline
-                ] += samples[baseline]["logP(s) unpenalized"].max().item() / len(
-                    val_data
-                )
-                if samples[baseline][self.diversity_metric_name] is None:
-                    baseline_performance.loc[
-                        self.diversity_metric_name, baseline
-                    ] = None
-                else:
-                    baseline_performance.loc[
-                        self.diversity_metric_name, baseline
-                    ] += samples[baseline][self.diversity_metric_name] / len(val_data)
-                baseline_performance.loc["sentence length", baseline] += samples[
-                    baseline
-                ]["sentence length"].float().mean().item() / len(val_data)
-        baseline_performance = baseline_performance.reset_index(names="metric")
-        if self.logger is not None:
-            self.logger.log_table(
-                "val/baseline performance", dataframe=baseline_performance
-            )
-
-        # Log baseline probes
-        if self.hparams.val_probes is not None and self.logger is not None:
-            samples_table = self.sample_probes_baselines(self.hparams.val_probes)
-            self.logger.log_table(
-                "samples/val_probes (baselines)", dataframe=samples_table
-            )
-
-    def sample_probes(self, probes, n_samples=4):
-        assert isinstance(probes, list) and probes[0].ndim == 1
-        samples = []
-        for probe in probes:
-            probe_str = self.tokenizer.decode(probe)
-            with torch.no_grad():
-                generated_text, _, _, log_r, log_r_unpenalized = self.forward(
-                    probe.to(self.device), n_samples=n_samples
-                )
-            log_ps, log_ps_unpenalized = get_termination_vals(
-                generated_text=generated_text,
-                log_pf=None,
-                log_pterm=None,
-                log_r=log_r,
-                log_r_unpenalized=log_r_unpenalized,
-                termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(probe),
-            )[1:3]
-            log_ps *= self.reward.temperature
-            log_ps_unpenalized *= self.reward.temperature
-            generated_text = generated_text[:, len(probe) :]
-            generated_text = self.tokenizer.batch_decode(generated_text)
-            generated_text = [text.replace(".", "") for text in generated_text]
-            for i in range(len(generated_text)):
-                samples.append(
-                    {
-                        "Prompt": probe_str,
-                        "Sampled sentence": generated_text[i],
-                        "logP(s)": log_ps[i].item(),
-                        "logP(s) unpenalized": log_ps_unpenalized[i].item(),
-                    }
-                )
-        samples = pd.DataFrame(samples)
-        samples = samples.sort_values(by=["Prompt", "logP(s)"], ascending=False)
-        return samples
-
-    def sample_probes_baselines(self, probes, n_samples=4):
-        assert isinstance(probes, list) and probes[0].ndim == 1
-        samples = []
-        for probe in probes:
-            probe_str = self.tokenizer.decode(probe)
-            probe_samples = self.sample_baselines(
-                probe.to(self.device), n_samples=n_samples
-            )
-            for i in range(n_samples):
-                sample = {"Prompt": probe_str}
-                for baseline in probe_samples:
-                    sample[f"Sampled sentence ({baseline})"] = probe_samples[baseline][
-                        "sample"
-                    ][i]
-                    sample[f"logP(s) ({baseline})"] = probe_samples[baseline][
-                        "logP(s)"
-                    ][i].item()
-                    sample[f"logP(s) unpenalized ({baseline})"] = probe_samples[
-                        baseline
-                    ]["logP(s) unpenalized"][i].item()
-                samples.append(sample)
-
-        samples = pd.DataFrame(samples)
-        samples = samples.sort_values(by=["Prompt"], ascending=False)
-
-        return samples
-
-    def sample_baselines(self, prompt, n_samples=4):
-        # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationMixin.generate
-        # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationConfig
-        assert prompt.ndim == 1
-        prompt = prompt.unsqueeze(0)
-
-        def generate(prompt, **kwargs):
-            with torch.no_grad():
-                self.model.eval()
-                generated_text = self.model.generate(
-                    prompt,
-                    min_new_tokens=self.hparams.min_sentence_len,
-                    max_new_tokens=self.hparams.max_sentence_len + 1,
-                    eos_token_id=self.end_of_sentence_token_id,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    forced_eos_token_id=self.end_of_sentence_token_id,
-                    suppress_tokens=torch.from_numpy(self.hparams.illegal_token_mask)
-                    .nonzero()
-                    .squeeze(-1),
-                    **kwargs,
-                )
-                self.model.train()
-                # TODO: Baseline reward computation disabled - requires ground_truth_target
-                # For now, just compute sentence length without rewards
-                sentence_len = (
-                    (generated_text[:, prompt.shape[1]:] == self.end_of_sentence_token_id)
-                    .byte()
-                    .argmax(dim=-1)
-                )
-                # Set dummy rewards (zeros) for baselines
-                log_ps = torch.zeros(generated_text.shape[0], device=generated_text.device)
-                log_ps_unpenalized = torch.zeros(generated_text.shape[0], device=generated_text.device)
-
-            generated_text = generated_text[:, prompt.shape[1] :]
-            generated_text = torch.where(
-                generated_text == self.tokenizer.eos_token_id,
-                self.end_of_sentence_token_id,
-                generated_text,
-            )
-            generated_text = self.tokenizer.batch_decode(generated_text)
-            generated_text = [text.replace(".", "") for text in generated_text]
-
-            if len(generated_text) > 1:
-                diversity = self.diversity_metric(generated_text)
-            else:
-                diversity = None
-
-            if len(generated_text) == 1:
-                generated_text = generated_text * n_samples
-                log_ps = log_ps.expand(n_samples, -1)
-                log_ps_unpenalized = log_ps_unpenalized.expand(n_samples, -1)
-
-            return {
-                "sample": generated_text,
-                "logP(s)": log_ps,
-                "logP(s) unpenalized": log_ps_unpenalized,
-                "sentence length": sentence_len,
-                self.diversity_metric_name: diversity,
-            }
-
-        samples = {}
-
-        # Beam search
-        samples["beam"] = generate(
-            prompt=prompt,
-            do_sample=False,
-            num_beams=n_samples * 5,
-            length_penalty=0.0,
-        )
-        samples["beam [fair]"] = generate(
-            prompt=prompt,
-            do_sample=False,
-            num_beams=n_samples,
-            length_penalty=0.0,
-        )
-
-        # Diverse beam search
-        samples["diverse beam"] = generate(
-            prompt=prompt,
-            num_beams=n_samples * 5,
-            num_beam_groups=n_samples,
-            num_return_sequences=n_samples,
-            diversity_penalty=1.0,
-            length_penalty=0.0,
-        )
-        samples["diverse beam [fair]"] = generate(
-            prompt=prompt,
-            num_beams=n_samples,
-            num_beam_groups=n_samples,
-            num_return_sequences=n_samples,
-            diversity_penalty=1.0,
-            length_penalty=0.0,
-        )
-
-        # Nucleaus sampling
-        samples["nucleus"] = generate(
-            prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
-            top_k=0,
-            top_p=0.95,
-        )
-
-        # LM
-        samples["LM"] = generate(
-            prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
-            top_k=0,
-        )
-
-        # LM with temperature
-        samples["LM tempered"] = generate(
-            prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
-            top_k=0,
-            temperature=self.hparams.reward_temp_end,
-        )
-
-        # Greedy
-        samples["greedy"] = generate(
-            prompt=prompt,
-            do_sample=False,
-        )
-
-        return samples
+    def setup(self, stage: str):
+        if not self._ref_initialized:
+            if self.ref_model is None:
+                # Safely clone the current policy as the frozen reference
+                self.ref_model = copy.deepcopy(self.model)
+            # Ensure proper device placement and freeze
+            self.ref_model.to(self.device)
+            self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad_(False)
+            self._ref_initialized = True
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
+
+    @staticmethod
+    def _gather_log_probs_from_logits(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+        log_probs = logits.log_softmax(dim=-1)
+        gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        return gathered
+
+    def _compute_decoder_per_token_logps(self, model, encoder_inputs, decoder_input_ids, target_ids) -> torch.Tensor:
+        # Teacher-forced forward pass over decoder tokens to get logits at each step
+        outputs = model(
+            input_ids=encoder_inputs["input_ids"],
+            attention_mask=encoder_inputs.get("attention_mask", None),
+            decoder_input_ids=decoder_input_ids,
+            use_cache=False,
+        )
+        logits = outputs.logits  # (B, L, V)
+        per_token_logps = self._gather_log_probs_from_logits(logits, target_ids)  # (B, L)
+        return per_token_logps
+
+    @torch.no_grad()
+    def _generate_sequences(self, encoder_inputs):
+        generation_kwargs = dict(
+            max_new_tokens=self.hparams.max_new_tokens,
+            do_sample=True,
+            temperature=self.hparams.gen_temperature,
+            num_return_sequences=self.hparams.num_return_sequences,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.end_of_sentence_token_id,
+        )
+        gen = self.model.generate(
+            input_ids=encoder_inputs["input_ids"],
+            attention_mask=encoder_inputs.get("attention_mask", None),
+            forced_bos_token_id=self.tgt_lang_id,
+            **generation_kwargs,
+        )
+        return gen
+
+    def training_step(self, prompt, batch_idx):
+        # prompt is a tuple: (source_encoded, target_string)
+        src_prompt = prompt[0]
+        ground_truth = prompt[1]
+
+        # Move encoder inputs to device
+        encoder_inputs = {
+            k: v.to(self.device) for k, v in src_prompt.items()
+        }
+
+        # Generate K sequences (on-policy)
+        generated_sequences = self._generate_sequences(encoder_inputs)  # (K, Ldec)
+
+        # Build decoder inputs/targets for per-token log-prob computation
+        # Shift: input is tokens up to last-1, target is tokens from position 1..
+        decoder_input_ids = generated_sequences[:, :-1]
+        target_ids = generated_sequences[:, 1:]
+
+        # Compute per-token logps under current policy
+        per_token_logps = self._compute_decoder_per_token_logps(
+            self.model, encoder_inputs, decoder_input_ids, target_ids
+        )  # (B, L-1)
+
+        # Compute per-token logps under reference policy
+        with torch.no_grad():
+            ref_per_token_logps = self._compute_decoder_per_token_logps(
+                self.ref_model, encoder_inputs, decoder_input_ids, target_ids
+            )
+
+        # Build completion mask: valid tokens until first eos (exclude pads)
+        is_pad = target_ids == self.tokenizer.pad_token_id
+        is_eos = target_ids == self.end_of_sentence_token_id
+        # Mask positions after first eos per sequence
+        eos_cumsum = is_eos.cumsum(dim=-1)
+        after_eos = eos_cumsum >= 1
+        completion_mask = (~is_pad) & (~after_eos)
+
+        # Compute scalar rewards per sequence using BLEU+chrF against ground truth
+        # Decode generated sequences without special tokens
+        generated_texts = self.tokenizer.batch_decode(
+            torch.where(generated_sequences == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, generated_sequences),
+            skip_special_tokens=True,
+        )
+        # Ground truth may be a single string replicated across K
+        if isinstance(ground_truth, str):
+            references = [ground_truth] * len(generated_texts)
+        else:
+            references = [ground_truth for _ in range(len(generated_texts))]
+
+        import sacrebleu
+        rewards = []
+        for hyp, ref in zip(generated_texts, references):
+            bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
+            chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
+            combined = 0.5 * bleu + 0.5 * chrf
+            rewards.append(torch.log(torch.tensor(combined + 1e-8, device=self.device)))
+        rewards = torch.stack(rewards, dim=0)  # (B,)
+
+        # Normalize rewards -> advantages
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+        advantages = advantages.unsqueeze(1).expand_as(per_token_logps)
+
+        # PPO-style ratio without stored behavior logps (on-policy baseline trick)
+        ratio = torch.exp(per_token_logps - per_token_logps.detach())
+        clipped_ratio = torch.clamp(ratio, 1 - self.hparams.clip_param, 1 + self.hparams.clip_param)
+        per_token_adv_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
+
+        # KL penalty versus reference policy
+        ref_minus_pi = ref_per_token_logps - per_token_logps
+        per_token_kl = torch.exp(ref_minus_pi) - ref_minus_pi - 1.0
+
+        per_token_obj = per_token_adv_loss - self.hparams.beta * per_token_kl
+        per_token_obj = per_token_obj * completion_mask
+
+        # Mean over valid tokens per sequence, then batch mean
+        token_counts = completion_mask.sum(dim=-1).clamp_min(1)
+        seq_losses = -per_token_obj.sum(dim=-1) / token_counts
+        loss = seq_losses.mean()
+
+        # Logging
+        with torch.no_grad():
+            kl_mean = (per_token_kl * completion_mask).sum() / token_counts.sum()
+        self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/kl", kl_mean, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/reward", rewards.mean(), on_step=False, on_epoch=True, sync_dist=True)
+
+        return loss

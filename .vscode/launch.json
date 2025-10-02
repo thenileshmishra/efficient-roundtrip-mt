@@ -4,15 +4,14 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-    
         {
-            "name": "Python Debugger: Current File",
+            "name": "Debug: Train GRPO",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "${workspaceFolder}/train.py",
             "console": "integratedTerminal",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0",
+                "TOKENIZERS_PARALLELISM": "true"
             },
             "justMyCode": false
         }

@@ -1,17 +1,12 @@
-from types import MethodType
 import hydra
 import torch
 import pytorch_lightning as pl
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
 )
-from utils import (
-    FrozenModelSentenceGivenPrompt,
-    ReplayBuffer,
-)
-from lightning_module import TranslationGFNTask
+from lightning_module import TranslationGRPOTask
 from lightning_data import TranslationDataModule
 
 
@@ -21,14 +16,7 @@ def train(config: DictConfig):
 
     model, tokenizer = get_model(config)
 
-    end_of_sentence_token_id = tokenizer.eos_token_id
-        
     illegal_token_mask = None
-    reward = get_reward(config, end_of_sentence_token_id, illegal_token_mask)
-    reward_buffer = ReplayBuffer(
-        buffer_size=config.task.reward.buffer_size,
-        termination_token_id=end_of_sentence_token_id,
-    )
 
     data = TranslationDataModule(
         tokenizer=tokenizer,
@@ -40,30 +28,18 @@ def train(config: DictConfig):
         )
     
     data.setup("fit")
-    train_probes = [(data.train_data[i][0][0], data.train_data[i][1]) for i in range(config.task.eval.n_probes)]
-    val_probes = [(data.val_data[i][0][0], data.val_data[i][1]) for i in range(config.task.eval.n_probes)]
 
-    task = TranslationGFNTask(
+    task = TranslationGRPOTask(
         model=model,
         tokenizer=tokenizer,
-        reward=reward,
-        reward_buffer=reward_buffer,
-        n_samples=config.task.training.n_samples,
-        lr=config.task.training.lr,
-        subtb_lambda=config.task.training.subtb_lambda,
-        pf_temp_high=config.task.training.pf_temp_high,
-        pf_temp_low=config.task.training.pf_temp_low,
-        pf_temp_prob=config.task.training.pf_temp_prob,
-        use_buffer_prob=config.task.training.use_buffer_prob,
-        min_sentence_len=config.task.constraints.min_sentence_len,
-        max_sentence_len=config.task.constraints.max_sentence_len,
-        reward_temp_start=config.task.reward.temp_start,
-        reward_temp_end=config.task.reward.temp_end,
-        reward_temp_horizon=config.task.reward.temp_horizon,
-        illegal_token_mask=illegal_token_mask,
-        train_probes=train_probes,
-        val_probes=val_probes,
+        lr=getattr(config.task.training, 'lr', 1e-5),
+        num_return_sequences=getattr(config.task.training, 'num_return_sequences', 8),
+        max_new_tokens=getattr(config.task.constraints, 'max_sentence_len', 128),
+        gen_temperature=getattr(config.task.training, 'gen_temperature', 0.9),
+        beta=getattr(config.task.training, 'beta', 0.04),
+        clip_param=getattr(config.task.training, 'clip_param', 0.2),
         tgt_lang_id=tokenizer.convert_tokens_to_ids(config.task.data.target_lang),
+        reference_model_name=getattr(config.task.model, 'reference_name', None),
     )
 
     trainer = pl.Trainer(
@@ -90,36 +66,7 @@ def get_model(config: DictConfig):
     )
     return model, tokenizer
 
-
-def get_reward(config: DictConfig, sentence_token_id, illegal_token_mask):
-    if config.task.reward.sentence_validator is None:
-        sentence_validator, valid_sentence_alpha = None, None
-    elif config.task.reward.sentence_validator == "rule":
-        sentence_validator, valid_sentence_alpha = (
-            # RuleSentenceValidator(sentence_token_id=sentence_token_id),
-            config.task.reward.valid_sentence_alpha,
-        )
-    elif config.task.reward.sentence_validator == "model":
-        # sentence_validator, valid_sentence_alpha = (
-        #     ModelSentenceValidator(sentence_token_id=sentence_token_id),
-        #     config.task.reward.valid_sentence_alpha,
-        # )
-        pass
-    else:
-        raise ValueError(
-            f"Invalid sentence validator: {config.task.reward.sentence_validator}"
-        )
-
-    reward = FrozenModelSentenceGivenPrompt(
-        sentence_token_id=sentence_token_id,
-        min_len=config.task.constraints.min_sentence_len,
-        sentence_validator=sentence_validator,
-        valid_sentence_alpha=valid_sentence_alpha,
-        bleu_weight=config.task.reward.get("bleu_weight", 0.5),
-        chrf_weight=config.task.reward.get("chrf_weight", 0.5),
-    )
-
-    return reward
+    
 
 
 if __name__ == "__main__":
