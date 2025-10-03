@@ -1,0 +1,15 @@
+lr: 0.0001
+num_return_sequences: 32
+max_new_tokens: 256
+gen_temperature: 0.6
+beta: 0.04
+clip_param: 0.2
+tgt_lang_id: 256018
+reference_model_name: null
+illegal_token_mask: null
+data_path: breakend/nllb-multi-domain
+dataset_config_name: eng_Latn-ayr_Latn
+source_lang: eng_Latn
+target_lang: ayr_Latn
+sort_by_length: false
+sort_direction: asc

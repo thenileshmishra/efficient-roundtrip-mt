@@ -10,16 +10,14 @@ model:
   name: "facebook/nllb-200-distilled-600M"
 
 training:
-  subtb_lambda: 1.0
   pf_temp_high: 0.4
   pf_temp_low: 0.2
   pf_temp_prob: 0.666
   use_buffer_prob: 0.25
   n_samples: 2
   lr: 0.0001
-  accumulate_grad_batches: 25
-  epochs: 300
-  use_4bit: False
+  accumulate_grad_batches: 1
+  epochs: 2
 
 eval:
   n_probes: 10
@@ -38,17 +36,17 @@ reward:
 
 callbacks:
   - _target_: pytorch_lightning.callbacks.ModelCheckpoint
-    monitor: "val/logP(s) (avg)"
+    monitor: "val/chrf"
     mode: "max"
     save_last: True
     dirpath: ${save_dir}/checkpoints/${now:%Y-%m-%d}_${now:%H-%M-%S}
     filename: "epoch={epoch:03d}"
     auto_insert_metric_name: True
   - _target_: pytorch_lightning.callbacks.EarlyStopping
-    monitor: "val/logP(s) (avg)"
+    monitor: "val/chrf"
     mode: "max"
     patience: 10
 
 constraints:
   min_sentence_len: 1
-  max_sentence_len: 128
+  max_sentence_len: 256
