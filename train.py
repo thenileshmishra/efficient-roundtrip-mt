@@ -46,6 +46,7 @@ def train(config: DictConfig):
     trainer = pl.Trainer(
         accelerator=config.device.accelerator,
         max_epochs=config.task.training.epochs,
+        min_epochs=config.task.training.epochs,
         accumulate_grad_batches=config.task.training.accumulate_grad_batches,
         check_val_every_n_epoch=1,
         logger=config.logger
