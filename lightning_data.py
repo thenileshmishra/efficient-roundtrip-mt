@@ -42,8 +42,9 @@ class TranslationDataModule(LightningDataModule):
         prompts = load_dataset(
             self.hparams.data_path, self.hparams.dataset_config_name, trust_remote_code=True
         )
-        self.train_data = TranslationDataPipe(prompts["train"].select(range(64)), self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
-        self.val_data = TranslationDataPipe(prompts["valid"].select(range(64)), self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
+        
+        self.train_data = TranslationDataPipe(prompts["train"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
+        self.val_data = TranslationDataPipe(prompts["valid"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
 
         # Optional: build a sampler to iterate by increasing source length
         if self.hparams.sort_by_length:
@@ -78,8 +79,8 @@ class TranslationDataPipe(MapDataPipe):
 
     def __getitem__(self, index):
         src_prompt = self.tokenizer(
-            self.prompts[index][self.src_col],
+            self.prompts[1][self.src_col],
             return_tensors="pt",
         )
-        str_tgt_prompt = self.prompts[index][self.tgt_col]
+        str_tgt_prompt = self.prompts[1][self.tgt_col]
         return src_prompt, str_tgt_prompt

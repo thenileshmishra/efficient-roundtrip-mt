@@ -96,7 +96,8 @@ class TranslationGRPOTask(LightningModule):
         # prompt is a tuple: (source_encoded, target_string)
         src_prompt = prompt[0]
         ground_truth = prompt[1]
-
+        # put the strings in wandb table 
+        
         encoder_inputs = {
             k: v.to(self.device) for k, v in src_prompt.items()
         }
@@ -127,7 +128,6 @@ class TranslationGRPOTask(LightningModule):
             torch.where(generated_sequences == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, generated_sequences),
             skip_special_tokens=True,
         )
-        
         # Ground truth may be a single string replicated across K
         if isinstance(ground_truth, str):
             references = [ground_truth] * len(generated_texts)
@@ -135,20 +135,26 @@ class TranslationGRPOTask(LightningModule):
             references = [ground_truth for _ in range(len(generated_texts))]
 
         rewards = []
-        # bleu_scores = []
+        bleu_scores = []
         chrf_scores = []
         for hyp, ref in zip(generated_texts, references):
-            # bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
+            bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
             chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
-            # bleu_scores.append(bleu)
+            bleu_scores.append(bleu)
             chrf_scores.append(chrf)
-            # combined = 0.5 * bleu + 0.5 * chrf
-            combined = chrf
+            combined = 0.5 * bleu + 0.5 * chrf
+            # combined = chrf
             rewards.append(torch.log(torch.tensor(combined + 1e-8, device=self.device)))
-        # bleu_mean = torch.tensor(bleu_scores, device=self.device).mean()
+        bleu_mean = torch.tensor(bleu_scores, device=self.device).mean()
         chrf_mean = torch.tensor(chrf_scores, device=self.device).mean()
         rewards = torch.stack(rewards, dim=0)  # (B,)
-
+        columns = ["src_prompts", "generated", "combined_reward", "step"]
+        # log generated texts to wandb table (rows must match columns)
+        rows = [
+            [src, gen, combined, int(self.global_step)]
+            for src, gen, combined in zip(references, generated_texts, rewards)
+        ]
+        print(rows[0])
         ### GRPO OBJECTIVE ###
         # Normalize rewards -> advantages (group-normalized over G samples for the prompt)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
@@ -174,43 +180,46 @@ class TranslationGRPOTask(LightningModule):
         # Logging
         with torch.no_grad():
             kl_mean = (per_token_kl * completion_mask).sum() / token_counts.sum()
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train/kl", kl_mean, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/reward", rewards.mean(), on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        self.log("train/kl", kl_mean, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("train/reward", rewards.mean(), on_step=True, on_epoch=False, sync_dist=True)
         # log bleu and chrf
         # self.log("train/bleu", bleu_mean, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/chrf", chrf_mean, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/chrf", chrf_mean, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("train/bleu", bleu_mean, on_step=True, on_epoch=False, sync_dist=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        src_prompt, ground_truth = batch
-        encoder_inputs = {k: v.to(self.device) for k, v in src_prompt.items()}
+    # def validation_step(self, batch, batch_idx):
+    #     print("VALIDATION STEP.....")
+    #     src_prompt, ground_truth = batch
+    #     encoder_inputs = {k: v.to(self.device) for k, v in src_prompt.items()}
 
-        with torch.no_grad():
-            gen = self.model.generate(
-                input_ids=encoder_inputs["input_ids"],
-                attention_mask=encoder_inputs.get("attention_mask", None),
-                forced_bos_token_id=self.tgt_lang_id,
-                max_new_tokens=self.hparams.max_new_tokens,
-                do_sample=False,
-                num_return_sequences=1,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.end_of_sentence_token_id,
-            )
+    #     with torch.no_grad():
+    #         gen = self.model.generate(
+    #             input_ids=encoder_inputs["input_ids"],
+    #             attention_mask=encoder_inputs.get("attention_mask", None),
+    #             forced_bos_token_id=self.tgt_lang_id,
+    #             max_new_tokens=self.hparams.max_new_tokens,
+    #             do_sample=False,
+    #             num_return_sequences=1,
+    #             pad_token_id=self.tokenizer.pad_token_id,
+    #             eos_token_id=self.end_of_sentence_token_id,
+    #         )
 
-        decoded = self.tokenizer.batch_decode(
-            torch.where(gen == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, gen),
-            skip_special_tokens=True,
-        )
+    #     decoded = self.tokenizer.batch_decode(
+    #         torch.where(gen == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, gen),
+    #         skip_special_tokens=True,
+    #     )
 
-        hyp = decoded[0]
-        ref = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
-        chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
-        self.log("val/chrf", chrf, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+    #     hyp = decoded[0]
+    #     ref = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
+    #     chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
+    #     self.log("val/chrf", chrf, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-    def on_train_end(self):
-        # Save HF model and tokenizer at the end of training in the model directory
-        model_dir = os.path.join(getattr(self.trainer, "default_root_dir", "."), "model")
-        os.makedirs(model_dir, exist_ok=True)
-        self.model.save_pretrained(model_dir)
-        self.tokenizer.save_pretrained(model_dir)
+    # def on_validation_end(self):
+    #     print("SAVING MODEL.....")
+    #     # Save HF model and tokenizer at the end of training in the model directory
+    #     model_dir = os.path.join(getattr(self.trainer, "default_root_dir", "."), "model")
+    #     os.makedirs(model_dir, exist_ok=True)
+    #     self.model.save_pretrained(model_dir)
+    #     self.tokenizer.save_pretrained(model_dir)

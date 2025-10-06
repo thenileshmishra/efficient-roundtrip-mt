@@ -34,9 +34,9 @@ def train(config: DictConfig):
         model=model,
         tokenizer=tokenizer,
         lr=getattr(config.task.training, 'lr', 1e-5),
-        num_return_sequences=getattr(config.task.training, 'num_return_sequences', 32),
-        max_new_tokens=getattr(config.task.constraints, 'max_sentence_len', 256),
-        gen_temperature=getattr(config.task.training, 'gen_temperature', 0.6),
+        num_return_sequences=getattr(config.task.training, 'num_return_sequences', 40),
+        max_new_tokens=getattr(config.task.constraints, 'max_sentence_len', 128),
+        gen_temperature=getattr(config.task.training, 'gen_temperature', 0.7),
         beta=getattr(config.task.training, 'beta', 0.04),
         clip_param=getattr(config.task.training, 'clip_param', 0.2),
         tgt_lang_id=tokenizer.convert_tokens_to_ids(config.task.data.target_lang),
@@ -48,7 +48,7 @@ def train(config: DictConfig):
         max_epochs=config.task.training.epochs,
         min_epochs=config.task.training.epochs,
         accumulate_grad_batches=config.task.training.accumulate_grad_batches,
-        check_val_every_n_epoch=1,
+        check_val_every_n_epoch=10,
         logger=config.logger
         if isinstance(config.logger, bool)
         else hydra.utils.instantiate(config.logger),
