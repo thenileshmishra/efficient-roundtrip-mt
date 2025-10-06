@@ -79,8 +79,8 @@ class TranslationDataPipe(MapDataPipe):
 
     def __getitem__(self, index):
         src_prompt = self.tokenizer(
-            self.prompts[1][self.src_col],
+            self.prompts[index][self.src_col],
             return_tensors="pt",
         )
-        str_tgt_prompt = self.prompts[1][self.tgt_col]
+        str_tgt_prompt = self.prompts[index][self.tgt_col]
         return src_prompt, str_tgt_prompt

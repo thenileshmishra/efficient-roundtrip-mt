@@ -11,6 +11,7 @@ class TranslationGRPOTask(LightningModule):
         model,
         tokenizer,
         lr,
+        updates_per_batch: int = 50,
         num_return_sequences=8,
         max_new_tokens=256,
         gen_temperature=0.9,
@@ -26,6 +27,9 @@ class TranslationGRPOTask(LightningModule):
         self.tokenizer = tokenizer
         self.end_of_sentence_token_id = tokenizer.eos_token_id
         self.tgt_lang_id = tgt_lang_id
+        # Manual optimization for multiple optimizer steps per batch
+        # See: PyTorch Lightning manual optimization guide
+        self.automatic_optimization = False
 
         # Reference policy (frozen)
         if reference_model_name is not None:
@@ -83,6 +87,8 @@ class TranslationGRPOTask(LightningModule):
             num_return_sequences=self.hparams.num_return_sequences,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.end_of_sentence_token_id,
+            top_k=getattr(self.hparams, "top_k", 100),
+            top_p=getattr(self.hparams, "top_p", 0.9),
         )
         gen = self.model.generate(
             input_ids=encoder_inputs["input_ids"],
@@ -91,6 +97,7 @@ class TranslationGRPOTask(LightningModule):
             **generation_kwargs,
         )
         return gen
+    
  
     def training_step(self, prompt, batch_idx):
         # prompt is a tuple: (source_encoded, target_string)
@@ -101,93 +108,99 @@ class TranslationGRPOTask(LightningModule):
         encoder_inputs = {
             k: v.to(self.device) for k, v in src_prompt.items()
         }
+        opt = self.optimizers()
+        
+        for _ in range(self.hparams.updates_per_batch):
 
-        generated_sequences = self._generate_sequences(encoder_inputs)  # (K, Ldec)
+            generated_sequences = self._generate_sequences(encoder_inputs)  # (K, Ldec)
 
-        decoder_input_ids = generated_sequences[:, :-1]
-        target_ids = generated_sequences[:, 1:]
-        # Compute per-token logps under current policy
-        per_token_logps = self._compute_decoder_per_token_logps(
-            self.model, encoder_inputs, decoder_input_ids, target_ids
-        )  # (B, L-1)
+            decoder_input_ids = generated_sequences[:, :-1]
+            target_ids = generated_sequences[:, 1:]
+            # Compute per-token logps under current policy
+            per_token_logps = self._compute_decoder_per_token_logps(
+                self.model, encoder_inputs, decoder_input_ids, target_ids
+            )  # (B, L-1)
 
-        with torch.no_grad():
-            ref_per_token_logps = self._compute_decoder_per_token_logps(
-                self.ref_model, encoder_inputs, decoder_input_ids, target_ids
+            with torch.no_grad():
+                ref_per_token_logps = self._compute_decoder_per_token_logps(
+                    self.ref_model, encoder_inputs, decoder_input_ids, target_ids
+                )
+
+            # Build completion mask
+            is_pad = target_ids == self.tokenizer.pad_token_id
+            is_eos = target_ids == self.end_of_sentence_token_id
+            eos_cumsum = is_eos.cumsum(dim=-1)
+            after_eos = eos_cumsum >= 1
+            completion_mask = (~is_pad) & (~after_eos)
+
+            # Decode generated sequences without special tokens for reward computation
+            generated_texts = self.tokenizer.batch_decode(
+                torch.where(generated_sequences == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, generated_sequences),
+                skip_special_tokens=True,
             )
+            # Ground truth may be a single string replicated across K
+            if isinstance(ground_truth, str):
+                references = [ground_truth] * len(generated_texts)
+            else:
+                references = [ground_truth for _ in range(len(generated_texts))]
 
-        # Build completion mask
-        is_pad = target_ids == self.tokenizer.pad_token_id
-        is_eos = target_ids == self.end_of_sentence_token_id
-        eos_cumsum = is_eos.cumsum(dim=-1)
-        after_eos = eos_cumsum >= 1
-        completion_mask = (~is_pad) & (~after_eos)
+            rewards = []
+            chrf_scores = []
+            for hyp, ref in zip(generated_texts, references):  
+                chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
+                chrf_scores.append(chrf)
+                rewards.append(torch.log(torch.tensor(chrf + 1e-8, device=self.device)))
+            chrf_mean = torch.tensor(chrf_scores, device=self.device).mean()
+            rewards = torch.stack(rewards, dim=0)  # (B,)
+            columns = ["src_prompts", "generated", "reward", "step"]
+            # log generated texts to wandb table (rows must match columns)
+            rows = [
+                [src, gen, reward, int(self.global_step)]
+                for src, gen, reward in zip(references, generated_texts, rewards)
+            ]
+            print("Reference Text: ",rows[0][0])
+            print("================================================")
+            print("Generated Text: ",rows[0][1])
+            print("================================================")
+            print("Reward: ",rows[0][2])
+            print("================================================")
+            print("Step: ",rows[0][3])
+            print("================================================")
+            ### GRPO OBJECTIVE ###
+            # Normalize rewards -> advantages (group-normalized over G samples for the prompt)
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+            advantages = advantages.unsqueeze(1).expand_as(per_token_logps)
 
-        # Decode generated sequences without special tokens for reward computation
-        generated_texts = self.tokenizer.batch_decode(
-            torch.where(generated_sequences == self.tokenizer.pad_token_id, self.end_of_sentence_token_id, generated_sequences),
-            skip_special_tokens=True,
-        )
-        # Ground truth may be a single string replicated across K
-        if isinstance(ground_truth, str):
-            references = [ground_truth] * len(generated_texts)
-        else:
-            references = [ground_truth for _ in range(len(generated_texts))]
+            # PPO-style ratio without stored behavior logps (on-policy baseline trick)
+            ratio = torch.exp(per_token_logps - per_token_logps.detach())
+            clipped_ratio = torch.clamp(ratio, 1 - self.hparams.clip_param, 1 + self.hparams.clip_param)
+            per_token_adv_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
 
-        rewards = []
-        bleu_scores = []
-        chrf_scores = []
-        for hyp, ref in zip(generated_texts, references):
-            bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
-            chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
-            bleu_scores.append(bleu)
-            chrf_scores.append(chrf)
-            combined = 0.5 * bleu + 0.5 * chrf
-            # combined = chrf
-            rewards.append(torch.log(torch.tensor(combined + 1e-8, device=self.device)))
-        bleu_mean = torch.tensor(bleu_scores, device=self.device).mean()
-        chrf_mean = torch.tensor(chrf_scores, device=self.device).mean()
-        rewards = torch.stack(rewards, dim=0)  # (B,)
-        columns = ["src_prompts", "generated", "combined_reward", "step"]
-        # log generated texts to wandb table (rows must match columns)
-        rows = [
-            [src, gen, combined, int(self.global_step)]
-            for src, gen, combined in zip(references, generated_texts, rewards)
-        ]
-        print(rows[0])
-        ### GRPO OBJECTIVE ###
-        # Normalize rewards -> advantages (group-normalized over G samples for the prompt)
-        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
-        advantages = advantages.unsqueeze(1).expand_as(per_token_logps)
+            # KL penalty versus reference policy
+            ref_minus_pi = ref_per_token_logps - per_token_logps
+            per_token_kl = torch.exp(ref_minus_pi) - ref_minus_pi - 1.0
 
-        # PPO-style ratio without stored behavior logps (on-policy baseline trick)
-        ratio = torch.exp(per_token_logps - per_token_logps.detach())
-        clipped_ratio = torch.clamp(ratio, 1 - self.hparams.clip_param, 1 + self.hparams.clip_param)
-        per_token_adv_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
+            per_token_obj = per_token_adv_loss - self.hparams.beta * per_token_kl
+            per_token_obj = per_token_obj * completion_mask
 
-        # KL penalty versus reference policy
-        ref_minus_pi = ref_per_token_logps - per_token_logps
-        per_token_kl = torch.exp(ref_minus_pi) - ref_minus_pi - 1.0
+            # Mean over valid tokens per sequence, then batch mean
+            token_counts = completion_mask.sum(dim=-1).clamp_min(1)
+            seq_losses = -per_token_obj.sum(dim=-1) / token_counts
+            loss = seq_losses.mean()
 
-        per_token_obj = per_token_adv_loss - self.hparams.beta * per_token_kl
-        per_token_obj = per_token_obj * completion_mask
-
-        # Mean over valid tokens per sequence, then batch mean
-        token_counts = completion_mask.sum(dim=-1).clamp_min(1)
-        seq_losses = -per_token_obj.sum(dim=-1) / token_counts
-        loss = seq_losses.mean()
-
-        # Logging
-        with torch.no_grad():
-            kl_mean = (per_token_kl * completion_mask).sum() / token_counts.sum()
-        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-        self.log("train/kl", kl_mean, on_step=True, on_epoch=False, sync_dist=True)
-        self.log("train/reward", rewards.mean(), on_step=True, on_epoch=False, sync_dist=True)
-        # log bleu and chrf
-        # self.log("train/bleu", bleu_mean, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/chrf", chrf_mean, on_step=True, on_epoch=False, sync_dist=True)
-        self.log("train/bleu", bleu_mean, on_step=True, on_epoch=False, sync_dist=True)
-        return loss
+            # Logging
+            with torch.no_grad():
+                kl_mean = (per_token_kl * completion_mask).sum() / token_counts.sum()
+            self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
+            self.log("train/kl", kl_mean, on_step=True, on_epoch=False, sync_dist=False)
+            self.log("train/reward", rewards.mean(), on_step=True, on_epoch=False, sync_dist=False)
+            # log chrf
+            self.log("train/chrf", chrf_mean, on_step=True, on_epoch=False, sync_dist=False)
+            # Manual optimization: perform multiple optimizer steps per batch
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        return None
 
     # def validation_step(self, batch, batch_idx):
     #     print("VALIDATION STEP.....")
