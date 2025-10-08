@@ -14,6 +14,20 @@
                 "TOKENIZERS_PARALLELISM": "true"
             },
             "justMyCode": false
-        }
+        },
+        {
+            "name": "Debug: Train GRPO (DDP, 2 GPUs)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": ["--standalone", "--nnodes=1", "--nproc_per_node=2", "${workspaceFolder}/train.py"],
+            "console": "integratedTerminal",
+            "env": {
+              "TOKENIZERS_PARALLELISM": "true",
+              "CUDA_LAUNCH_BLOCKING": "1"
+            },
+            "subProcess": true,
+            "justMyCode": false
+          }
     ]
 }
