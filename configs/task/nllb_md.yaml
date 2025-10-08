@@ -23,19 +23,7 @@ reward:
   bleu_weight: 0.5  # Weight for BLEU score
   chrf_weight: 0.5  # Weight for chrF++ score
 
-callbacks:
-  - _target_: pytorch_lightning.callbacks.ModelCheckpoint
-    monitor: "val/chrf"
-    mode: "max"
-    save_last: True
-    dirpath: ${save_dir}/checkpoints/${now:%Y-%m-%d}_${now:%H-%M-%S}
-    filename: "epoch={epoch:03d}"
-    auto_insert_metric_name: True
-  - _target_: pytorch_lightning.callbacks.EarlyStopping
-    monitor: "val/chrf"
-    mode: "max"
-    patience: 10
-
+  
 constraints:
   min_sentence_len: 1
   max_sentence_len: 256

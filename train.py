@@ -3,7 +3,8 @@ import copy
 import hydra
 import torch
 import torch.distributed as dist
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+import wandb
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
@@ -13,7 +14,7 @@ from utils import (
     grpo_compute_loss_and_logs,
 )
 from dl import TranslationDataModule
-
+import time
 
 def _is_dist():
     return dist.is_available() and dist.is_initialized()
@@ -84,6 +85,14 @@ def train(config: DictConfig):
     model, tokenizer = get_model(config)
     model.to(device)
 
+    # Initialize Weights & Biases on rank 0
+    if rank == 0:
+        wandb.init(
+            project="grpo-translation-nllb-multi-domain",
+            name=time.strftime("%Y-%m-%d_%H-%M-%S"),
+            config=OmegaConf.to_container(config, resolve=True),
+        )
+
     # Reference model (frozen) on rank 0
     reference_name = getattr(config.task.model, "reference_name", None)
     if rank == 0:
@@ -144,11 +153,11 @@ def train(config: DictConfig):
             if rank == 0:
                 try:
                     batch = next(data_iter)
-                    # Expect batch = (src_prompt_dict, ground_truth_str)
-                    src_prompt, ground_truth = batch
+                    # Expect batch = (src_prompt_dict, ground_truth_str, sample_id)
+                    src_prompt, ground_truth, sample_id = batch
                     # Move batch to CPU for pickling broadcast
                     src_prompt_cpu = {k: v.cpu() for k, v in src_prompt.items()}
-                    payload = (src_prompt_cpu, ground_truth)
+                    payload = (src_prompt_cpu, ground_truth, sample_id)
                 except StopIteration:
                     payload = None
             else:
@@ -158,7 +167,7 @@ def train(config: DictConfig):
             if payload is None:
                 break  # epoch finished
 
-            src_prompt_cpu, ground_truth = payload
+            src_prompt_cpu, ground_truth, sample_id = payload
             # Move tensors to this rank's device
             encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt_cpu.items()}
 
@@ -202,7 +211,7 @@ def train(config: DictConfig):
                     loss.backward()
                     optimizer.step()
 
-                    if step_idx % int(getattr(config.task.training, "log_every_n_steps", 1)) == 0:
+                    if step_idx % int(getattr(config.task.training, "log_every_n_steps", 10)) == 0:
                         print(
                             f"[epoch {epoch}] step {step_idx} | loss={logs['loss'].item():.4f} "
                             f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} chrf={logs['chrf'].item():.4f}"
@@ -215,6 +224,23 @@ def train(config: DictConfig):
                         print(f"Reference: {ground_truth if isinstance(ground_truth, str) else str(ground_truth)}")
                         print(f"Generated: {gen_text}")
 
+                        # Log to Weights & Biases on rank 0
+                        wandb.log(
+                            {
+                                "loss": float(logs["loss"].item()),
+                                "kl": float(logs["kl"].item()),
+                                "chrf": float(logs["chrf"].item()),
+                                # "gradient_norm": float(torch.norm(model.parameters()).item()),
+                            }
+                        )
+                        # use wandb table to log the reference and generated text
+                        table = wandb.Table(
+                            columns=["reference", "generated", "sample_id"],
+                            data=[(ground_truth if isinstance(ground_truth, str) else str(ground_truth), gen_text, sample_id)]
+                        )
+                        wandb.log({
+                            "Translations": table
+                        })
                 # Synchronize and broadcast updated weights to all ranks
                 if _is_dist():
                     dist.barrier()
@@ -243,6 +269,7 @@ def train(config: DictConfig):
         os.makedirs(save_dir, exist_ok=True)
         model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
+        wandb.finish()
 
 
 

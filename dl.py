@@ -83,4 +83,4 @@ class TranslationDataPipe(MapDataPipe):
             return_tensors="pt",
         )
         str_tgt_prompt = self.prompts[index][self.tgt_col]
-        return src_prompt, str_tgt_prompt
+        return src_prompt, str_tgt_prompt, index
