@@ -18,7 +18,6 @@ from dl import TranslationDataModule
 def _is_dist():
     return dist.is_available() and dist.is_initialized()
 
-
 def _get_dist_info():
     if _is_dist():
         rank = dist.get_rank()
@@ -101,10 +100,11 @@ def train(config: DictConfig):
             p.requires_grad_(False)
 
     # Make sure all ranks start from the same initial weights
-    if rank == 0:
-        _broadcast_model_(model, src=0)
-    else:
-        _broadcast_model_(model, src=0)
+    if _is_dist():
+        dist.barrier()
+    _broadcast_model_(model, src=0)
+    if _is_dist():
+        dist.barrier()
 
     # Data module: only rank 0 pulls batches; others receive via broadcast
     illegal_token_mask = None
@@ -121,8 +121,8 @@ def train(config: DictConfig):
 
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
-    updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 1))
-    num_return_sequences = int(getattr(config.task.training, "num_return_sequences", 40))
+    updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
+    num_return_sequences = int(getattr(config.task.training, "num_return_sequences", 8))
     max_new_tokens = int(getattr(config.task.constraints, "max_sentence_len", 128))
     gen_temperature = float(getattr(config.task.training, "gen_temperature", 1.3))
     beta = float(getattr(config.task.training, "beta", 0.04))
@@ -202,16 +202,23 @@ def train(config: DictConfig):
                     loss.backward()
                     optimizer.step()
 
-                    if step_idx % int(getattr(config.task.training, "log_every_n_steps", 50)) == 0:
+                    if step_idx % int(getattr(config.task.training, "log_every_n_steps", 1)) == 0:
                         print(
                             f"[epoch {epoch}] step {step_idx} | loss={logs['loss'].item():.4f} "
                             f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} chrf={logs['chrf'].item():.4f}"
                         )
+                        # Print the reference and one generated sequence for inspection
+                        # Decode one generated sequence (first in batch)
+                        gen_text = tokenizer.decode(
+                            generated_all[0], skip_special_tokens=True
+                        )
+                        print(f"Reference: {ground_truth if isinstance(ground_truth, str) else str(ground_truth)}")
+                        print(f"Generated: {gen_text}")
 
-                    # Broadcast the updated model weights to all ranks
-                    _broadcast_model_(model, src=0)
-
-                # Ensure workers wait for the new weights before next update
+                # Synchronize and broadcast updated weights to all ranks
+                if _is_dist():
+                    dist.barrier()
+                _broadcast_model_(model, src=0)
                 if _is_dist():
                     dist.barrier()
 
@@ -223,8 +230,10 @@ def train(config: DictConfig):
             ref_model.eval()
             for p in ref_model.parameters():
                 p.requires_grad_(False)
-            # Also share refreshed weights so next epoch starts synchronized
-            _broadcast_model_(model, src=0)
+        if _is_dist():
+            dist.barrier()
+        # Share refreshed weights so next epoch starts synchronized
+        _broadcast_model_(model, src=0)
         if _is_dist():
             dist.barrier()
 
