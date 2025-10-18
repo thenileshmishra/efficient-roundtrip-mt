@@ -22,11 +22,19 @@ training:
   lr: 0.0001
   accumulate_grad_batches: 1
   epochs: 1
+  batch_size: 8
+  num_return_sequences: 8
+  updates_per_batch: 50
+  gen_temperature: 1.3
+  beta: 0.04
+  clip_param: 0.2
+  top_k: 100
+  top_p: 0.95
 
 eval:
   run: true
   only: false
-  translation_metric: ["bleu", "chrf"]
+  translation_metric: ["chrf++"]
   every_n_batches: 50
 
 reward:

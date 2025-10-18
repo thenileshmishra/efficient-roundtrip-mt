@@ -122,18 +122,26 @@ def _run_evaluation(
     with torch.no_grad():
         with tqdm(total=total_batches, desc="Evaluating", leave=False) as pbar:
             for idx, batch in enumerate(val_loader):
-                encoder_inputs, ground_truth, sample_id = batch
+                encoder_inputs, ground_truths, sample_ids = batch
+                if isinstance(ground_truths, str):
+                    ground_truths = [ground_truths]
+                else:
+                    ground_truths = list(ground_truths)
+                sample_ids = [int(sid) for sid in (sample_ids if isinstance(sample_ids, (list, tuple)) else [sample_ids])]
                 encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in encoder_inputs.items()}
                 generated = model.generate(
                     input_ids=encoder_inputs["input_ids"],
                     attention_mask=encoder_inputs.get("attention_mask"),
                     **generation_kwargs,
                 )
-                hypothesis = tokenizer.decode(generated[0], skip_special_tokens=True)
-                reference = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
-                predictions.append(hypothesis)
-                references.append(reference)
-                sample_records.append((reference, hypothesis, sample_id))
+                if generated.dim() == 1:
+                    generated = generated.unsqueeze(0)
+                for sample_idx, reference in enumerate(ground_truths):
+                    hypothesis = tokenizer.decode(generated[sample_idx], skip_special_tokens=True)
+                    ref_text = reference if isinstance(reference, str) else str(reference)
+                    predictions.append(hypothesis)
+                    references.append(ref_text)
+                    sample_records.append((ref_text, hypothesis, sample_ids[sample_idx]))
                 if pbar.total is not None:
                     pbar.update(1)
 
@@ -145,7 +153,7 @@ def _run_evaluation(
             references=[[r] for r in references],
         )
         results["eval/bleu"] = float(bleu_res.get("score", 0.0))
-    if predictions and "chrf" in requested_metrics:
+    if predictions and "chrf++" in requested_metrics:
         chrf_metric = evaluate.load("chrf")
         chrf_res = chrf_metric.compute(
             predictions=predictions,
@@ -153,7 +161,7 @@ def _run_evaluation(
             char_order=6,
             word_order=2,
         )
-        results["eval/chrf"] = float(chrf_res.get("score", 0.0))
+        results["eval/chrf++"] = float(chrf_res.get("score", 0.0))
 
     if results:
         print("Evaluation results:")
@@ -245,13 +253,14 @@ def train(config: DictConfig):
         source_lang=config.task.data.source_lang,
         target_lang=config.task.data.target_lang,
         sort_by_length=False,
+        train_batch_size=int(getattr(config.task.training, "batch_size", 1)),
     )
     data.setup("fit")
 
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
     updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
-    num_return_sequences = int(getattr(config.task.training, "num_return_sequences", 12))
+    num_return_sequences = int(getattr(config.task.training, "num_return_sequences", 4))
     max_new_tokens = int(getattr(config.task.constraints, "max_sentence_len", 128))
     gen_temperature = float(getattr(config.task.training, "gen_temperature", 1.3))
     beta = float(getattr(config.task.training, "beta", 0.04))
@@ -285,11 +294,15 @@ def train(config: DictConfig):
                 if rank == 0:
                     try:
                         batch = next(data_iter)
-                        # Expect batch = (src_prompt_dict, ground_truth_str, sample_id)
-                        src_prompt, ground_truth, sample_id = batch
+                        # Expect batch = (src_prompt_dict, ground_truth_list, sample_id_list)
+                        src_prompt, ground_truths, sample_ids = batch
                         # Move batch to CPU for pickling broadcast
                         src_prompt_cpu = {k: v.cpu() for k, v in src_prompt.items()}
-                        payload = (src_prompt_cpu, ground_truth, sample_id)
+                        payload = (
+                            src_prompt_cpu,
+                            list(ground_truths),
+                            [int(sid) for sid in sample_ids],
+                        )
                     except StopIteration:
                         payload = None
                 else:
@@ -299,9 +312,10 @@ def train(config: DictConfig):
                 if payload is None:
                     break  # epoch finished
 
-                src_prompt_cpu, ground_truth, sample_id = payload
+                src_prompt_cpu, ground_truths, sample_ids = payload
                 # Move tensors to this rank's device
                 encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt_cpu.items()}
+                batch_size = encoder_inputs["input_ids"].size(0)
 
                 for _ in range(updates_per_batch):
                     # Each rank generates sequences with current local model weights
@@ -313,7 +327,7 @@ def train(config: DictConfig):
                         max_new_tokens=max_new_tokens,
                         gen_temperature=gen_temperature,
                         num_return_sequences=num_return_sequences,
-                        top_k=int(getattr(config.task.training, "top_k", 1000)),
+                        top_k=int(getattr(config.task.training, "top_k", 100)),
                         top_p=float(getattr(config.task.training, "top_p", 0.95)),
                         end_of_sentence_token_id=tokenizer.eos_token_id,
                     )
@@ -324,7 +338,20 @@ def train(config: DictConfig):
                     )
 
                     if rank == 0:
-                        generated_all = torch.cat(gathered, dim=0)  # (world_size*K, L)
+                        seq_len = gathered[0].size(1)
+                        try:
+                            generated_rank_views = [
+                                tensor.reshape(batch_size, num_return_sequences, seq_len) for tensor in gathered
+                            ]
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                "Unable to reshape gathered sequences into (batch_size, num_return_sequences, seq_len). "
+                                f"Batch size={batch_size}, num_return_sequences={num_return_sequences}, seq_len={seq_len}."
+                            ) from exc
+                        generated_all = torch.stack(generated_rank_views, dim=2)  # (B, num_return_sequences, world, L)
+                        generated_all = generated_all.permute(0, 2, 1, 3).reshape(
+                            batch_size, -1, seq_len
+                        )  # (B, world*num_return_sequences, L)
 
                         # Compute GRPO loss on rank 0 and update
                         loss, logs = grpo_compute_loss_and_logs(
@@ -333,10 +360,11 @@ def train(config: DictConfig):
                             tokenizer,
                             encoder_inputs,
                             generated_all,
-                            ground_truth if isinstance(ground_truth, str) else str(ground_truth),
+                            ground_truths,
                             end_of_sentence_token_id=tokenizer.eos_token_id,
                             beta=beta,
                             clip_param=clip_param,
+                            tgt_lang_id=tgt_lang_id,
                         )
 
                         optimizer.zero_grad()
@@ -360,12 +388,15 @@ def train(config: DictConfig):
                                 f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} chrf={logs['chrf'].item():.4f} gradient_norm={grad_norm:.4f}"
                             )
                             # Print the reference and one generated sequence for inspection
-                            # Decode one generated sequence (first in batch)
-                            gen_text = tokenizer.decode(
-                                generated_all[0], skip_special_tokens=True
-                            )
-                            print(f"Reference: {ground_truth if isinstance(ground_truth, str) else str(ground_truth)}")
-                            print(f"Generated: {gen_text}")
+                            best_candidates = []
+                            for idx, reference in enumerate(ground_truths):
+                                decoded = tokenizer.decode(
+                                    generated_all[idx, 0], skip_special_tokens=True
+                                )
+                                best_candidates.append((reference, decoded, sample_ids[idx]))
+                            ref_text, gen_text, ref_sample_id = best_candidates[0]
+                            print(f"Reference[{ref_sample_id}]: {ref_text}")
+                            print(f"Generated[{ref_sample_id}]: {gen_text}")
 
                             # Log to Weights & Biases on rank 0
                             wandb.log(
@@ -377,11 +408,12 @@ def train(config: DictConfig):
                                 }
                             )
                             if train_table is not None:
-                                train_table.add_data(
-                                    ground_truth if isinstance(ground_truth, str) else str(ground_truth),
-                                    gen_text,
-                                    sample_id,
-                                )
+                                for reference, decoded, ref_sample_id in best_candidates:
+                                    train_table.add_data(
+                                        reference,
+                                        decoded,
+                                        ref_sample_id,
+                                    )
                                 wandb.log({"train/Translations": train_table}, step=step_idx)
                     # Synchronize and broadcast updated weights to all ranks
                     if _is_dist():

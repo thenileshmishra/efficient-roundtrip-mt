@@ -1,3 +1,4 @@
+import torch
 from torch.utils.data import DataLoader, Sampler
 from torchdata.datapipes.map import MapDataPipe
 from pytorch_lightning import LightningDataModule
@@ -30,6 +31,7 @@ class TranslationDataModule(LightningDataModule):
         target_lang,
         sort_by_length: bool = True,
         sort_direction: str = "asc",
+        train_batch_size: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters(ignore="tokenizer")
@@ -37,6 +39,7 @@ class TranslationDataModule(LightningDataModule):
         self.train_data = None
         self.val_data = None
         self._train_sampler = None
+        self._train_batch_size = max(int(train_batch_size), 1)
 
     def setup(self, stage):
         prompts = load_dataset(
@@ -59,11 +62,47 @@ class TranslationDataModule(LightningDataModule):
 
     def train_dataloader(self):
         if self._train_sampler is not None:
-            return DataLoader(self.train_data, sampler=self._train_sampler, batch_size=None, num_workers=0)
-        return DataLoader(self.train_data, shuffle=True, batch_size=None, num_workers=0)
+            return DataLoader(
+                self.train_data,
+                sampler=self._train_sampler,
+                batch_size=self._train_batch_size,
+                num_workers=0,
+                collate_fn=self._collate_batch,
+            )
+        return DataLoader(
+            self.train_data,
+            shuffle=True,
+            batch_size=self._train_batch_size,
+            num_workers=0,
+            collate_fn=self._collate_batch,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_data, batch_size=16, num_workers=0)
+        return DataLoader(
+            self.val_data,
+            batch_size=48,
+            num_workers=0,
+            collate_fn=self._collate_batch,
+        )
+
+    def _collate_batch(self, batch):
+        encoder_inputs_list, targets, sample_ids = zip(*batch)
+        prepared_inputs = []
+        for inputs in encoder_inputs_list:
+            item = {}
+            for key, value in inputs.items():
+                if isinstance(value, torch.Tensor):
+                    squeezed = value.squeeze(0)
+                    item[key] = squeezed.tolist() if squeezed.ndim == 1 else squeezed
+                else:
+                    item[key] = value
+            prepared_inputs.append(item)
+        batch_encoding = self.tokenizer.pad(
+            prepared_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        return batch_encoding, list(targets), list(sample_ids)
 
 
 class TranslationDataPipe(MapDataPipe):
@@ -79,8 +118,8 @@ class TranslationDataPipe(MapDataPipe):
 
     def __getitem__(self, index):
         src_prompt = self.tokenizer(
-            self.prompts[5][self.src_col],
+            self.prompts[index][self.src_col],
             return_tensors="pt",
         )
-        str_tgt_prompt = self.prompts[5][self.tgt_col]
+        str_tgt_prompt = self.prompts[index][self.tgt_col]
         return src_prompt, str_tgt_prompt, index

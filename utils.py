@@ -1,3 +1,6 @@
+import math
+from typing import Sequence
+
 import torch
 import evaluate
 
@@ -57,11 +60,17 @@ def grpo_compute_decoder_per_token_logps(
     target_ids: torch.Tensor,
 ) -> torch.Tensor:
     # Repeat encoder inputs to match number of sequences
-    batch_multiplier = decoder_input_ids.size(0)
-    repeated_input_ids = encoder_inputs["input_ids"].repeat(batch_multiplier, 1)
+    base_batch_size = encoder_inputs["input_ids"].size(0)
+    batch_multiplier = decoder_input_ids.size(0) // base_batch_size
+    if batch_multiplier * base_batch_size != decoder_input_ids.size(0):
+        raise ValueError(
+            "decoder_input_ids size does not align with encoder batch size. "
+            f"Got encoder batch {base_batch_size} and decoder batch {decoder_input_ids.size(0)}."
+        )
+    repeated_input_ids = encoder_inputs["input_ids"].repeat_interleave(batch_multiplier, dim=0)
     attention_mask = encoder_inputs.get("attention_mask", None)
     if attention_mask is not None:
-        attention_mask = attention_mask.repeat(batch_multiplier, 1)
+        attention_mask = attention_mask.repeat_interleave(batch_multiplier, dim=0)
 
     decoder_attention_mask = (decoder_input_ids != tokenizer.pad_token_id).long()
 
@@ -83,16 +92,34 @@ def grpo_compute_loss_and_logs(
     tokenizer,
     encoder_inputs,
     generated_sequences: torch.Tensor,
-    ground_truth: str,
+    ground_truths: Sequence[str],
     *,
     end_of_sentence_token_id: int,
     beta: float,
     clip_param: float,
 ):
+    if isinstance(ground_truths, str):
+        ground_truths = [ground_truths]
+    else:
+        ground_truths = list(ground_truths)
+
+    if generated_sequences.dim() != 3:
+        raise ValueError(
+            "generated_sequences must be a 3D tensor of shape (batch_size, num_candidates, seq_len). "
+            f"Received tensor with shape {tuple(generated_sequences.shape)}."
+        )
+
     device = next(model.parameters()).device
+    batch_size, num_candidates, seq_len = generated_sequences.size()
+    if batch_size != len(ground_truths):
+        raise ValueError(
+            f"Number of ground truths ({len(ground_truths)}) does not match generated batch size ({batch_size})."
+        )
+    flat_sequences = generated_sequences.reshape(batch_size * num_candidates, seq_len)
+
     # Prepare decoder inputs/targets
-    decoder_input_ids = generated_sequences[:, :-1]
-    target_ids = generated_sequences[:, 1:]
+    decoder_input_ids = flat_sequences[:, :-1]
+    target_ids = flat_sequences[:, 1:]
 
     # Compute per-token logps under current and reference policies
     per_token_logps = grpo_compute_decoder_per_token_logps(
@@ -109,17 +136,21 @@ def grpo_compute_loss_and_logs(
     eos_cumsum = is_eos.cumsum(dim=-1)
     after_eos = eos_cumsum >= 1
     completion_mask = (~is_pad) & (~after_eos)
+    completion_mask = completion_mask.reshape(batch_size, num_candidates, -1)
 
     # Decode generated sequences without special tokens for reward computation
     generated_texts = tokenizer.batch_decode(
         torch.where(
-            generated_sequences == tokenizer.pad_token_id,
+            generated_sequences.reshape(-1, generated_sequences.size(-1)) == tokenizer.pad_token_id,
             end_of_sentence_token_id,
-            generated_sequences,
+            generated_sequences.reshape(-1, generated_sequences.size(-1)),
         ),
         skip_special_tokens=True,
     )
-    references = [ground_truth for _ in range(len(generated_texts))]
+    references = [
+        ground_truths[idx // num_candidates]
+        for idx in range(len(generated_texts))
+    ]
 
     # Compute chrF with evaluate (character order=6) for rewards
     chrf_metric = evaluate.load("chrf")
@@ -132,10 +163,15 @@ def grpo_compute_loss_and_logs(
         rewards.append(torch.log(torch.tensor(sample + 1e-8, device=device)))
     chrf_mean = torch.tensor(chrf_scores, device=device).mean()
     rewards = torch.stack(rewards, dim=0)
-
+    # reshape back to (B, N)
+    rewards = rewards.reshape(batch_size, num_candidates)
     # Normalize rewards -> advantages
-    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
-    advantages = advantages.unsqueeze(1).expand_as(per_token_logps)
+    advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-4)
+    # Now, across examples, each token will have a different advantage for each candidate
+    # per_token_logps is (B*N, L), reshape naturally to (B, N, L)
+    per_token_logps = per_token_logps.reshape(batch_size, num_candidates, -1)
+    # now, advantages is (B, N, 1), expand it to (B, N, L)
+    advantages = advantages.unsqueeze(-1).expand_as(per_token_logps)
 
     # PPO-style ratio (on-policy baseline trick)
     ratio = torch.exp(per_token_logps - per_token_logps.detach())
@@ -143,7 +179,7 @@ def grpo_compute_loss_and_logs(
     per_token_adv_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
 
     # KL penalty versus reference policy
-    ref_minus_pi = ref_per_token_logps - per_token_logps
+    ref_minus_pi = ref_per_token_logps.reshape(batch_size, num_candidates, -1) - per_token_logps
     per_token_kl = torch.exp(ref_minus_pi) - ref_minus_pi - 1.0
 
     per_token_obj = per_token_adv_loss - beta * per_token_kl
@@ -151,6 +187,7 @@ def grpo_compute_loss_and_logs(
 
     # Mean over valid tokens per sequence, then batch mean
     token_counts = completion_mask.sum(dim=-1).clamp_min(1)
+    # per_token
     seq_losses = -per_token_obj.sum(dim=-1) / token_counts
     loss = seq_losses.mean()
 
