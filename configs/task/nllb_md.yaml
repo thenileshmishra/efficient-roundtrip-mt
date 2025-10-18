@@ -8,22 +8,33 @@ data:
 
 model:
   name: "facebook/nllb-200-distilled-600M"
+  # name: "facebook/nllb-200-3.3B"
+  use_lora: false
+  lora:
+    r: 8
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
 
 training:
   lr: 0.0001
   accumulate_grad_batches: 1
-  epochs: 500
+  epochs: 1
 
 eval:
-  n_probes: 10
+  run: true
+  only: false
   translation_metric: ["bleu", "chrf"]
+  every_n_batches: 50
 
 reward:
   # MT reward settings (BLEU and chrF++)
   bleu_weight: 0.5  # Weight for BLEU score
   chrf_weight: 0.5  # Weight for chrF++ score
 
-  
+
 constraints:
   min_sentence_len: 1
   max_sentence_len: 256

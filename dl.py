@@ -63,7 +63,7 @@ class TranslationDataModule(LightningDataModule):
         return DataLoader(self.train_data, shuffle=True, batch_size=None, num_workers=0)
 
     def val_dataloader(self):
-        return DataLoader(self.val_data, batch_size=None, num_workers=0)
+        return DataLoader(self.val_data, batch_size=16, num_workers=0)
 
 
 class TranslationDataPipe(MapDataPipe):
@@ -79,8 +79,8 @@ class TranslationDataPipe(MapDataPipe):
 
     def __getitem__(self, index):
         src_prompt = self.tokenizer(
-            self.prompts[index][self.src_col],
+            self.prompts[5][self.src_col],
             return_tensors="pt",
         )
-        str_tgt_prompt = self.prompts[index][self.tgt_col]
+        str_tgt_prompt = self.prompts[5][self.tgt_col]
         return src_prompt, str_tgt_prompt, index

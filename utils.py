@@ -1,5 +1,5 @@
 import torch
-import sacrebleu
+import evaluate
 
 # =========================
 # Distributed GRPO Utilities
@@ -121,14 +121,17 @@ def grpo_compute_loss_and_logs(
     )
     references = [ground_truth for _ in range(len(generated_texts))]
 
+    # Compute chrF with evaluate (character order=6) for rewards
+    chrf_metric = evaluate.load("chrf")
+    # evaluate returns an average score; we also approximate per-sample by recomputing individually
     rewards = []
     chrf_scores = []
     for hyp, ref in zip(generated_texts, references):
-        chrf = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
-        chrf_scores.append(chrf)
-        rewards.append(torch.log(torch.tensor(chrf + 1e-8, device=device)))
+        sample = chrf_metric.compute(predictions=[hyp], references=[[ref]], char_order=6, word_order=2)["score"] / 100.0
+        chrf_scores.append(sample)
+        rewards.append(torch.log(torch.tensor(sample + 1e-8, device=device)))
     chrf_mean = torch.tensor(chrf_scores, device=device).mean()
-    rewards = torch.stack(rewards, dim=0)  # (B,)
+    rewards = torch.stack(rewards, dim=0)
 
     # Normalize rewards -> advantages
     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
