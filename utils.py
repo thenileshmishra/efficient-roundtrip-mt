@@ -97,6 +97,7 @@ def grpo_compute_loss_and_logs(
     end_of_sentence_token_id: int,
     beta: float,
     clip_param: float,
+    tgt_lang_id: int,
 ):
     if isinstance(ground_truths, str):
         ground_truths = [ground_truths]
@@ -133,9 +134,10 @@ def grpo_compute_loss_and_logs(
     # Completion mask to ignore pads and tokens after first EOS
     is_pad = target_ids == tokenizer.pad_token_id
     is_eos = target_ids == end_of_sentence_token_id
+    is_lang_id = target_ids == tgt_lang_id
     eos_cumsum = is_eos.cumsum(dim=-1)
     after_eos = eos_cumsum >= 1
-    completion_mask = (~is_pad) & (~after_eos)
+    completion_mask = (~is_pad) & (~after_eos) & (~is_lang_id)
     completion_mask = completion_mask.reshape(batch_size, num_candidates, -1)
 
     # Decode generated sequences without special tokens for reward computation

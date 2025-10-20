@@ -168,14 +168,14 @@ def _run_evaluation(
         for key, value in results.items():
             print(f"  {key}: {value:.4f}")
 
-    # if wandb.run is not None and (results or sample_records):
-    #     log_payload = results.copy()
-    #     if sample_records:
-    #         eval_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
-    #         for reference, hypothesis, sample_id in sample_records:
-    #             eval_table.add_data(reference, hypothesis, sample_id)
-    #         log_payload["eval/Translations"] = eval_table
-    #     wandb.log(log_payload)
+    if wandb.run is not None and (results or sample_records):
+        log_payload = results.copy()
+        # if sample_records:
+        #     eval_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
+        #     for reference, hypothesis, sample_id in sample_records:
+        #         eval_table.add_data(reference, hypothesis, sample_id)
+        #     log_payload["eval/Translations"] = eval_table
+        wandb.log(log_payload)
 
     if was_training:
         model.train()
@@ -407,14 +407,14 @@ def train(config: DictConfig):
                                     "train/gradient_norm": float(grad_norm),
                                 }
                             )
-                            if train_table is not None:
-                                for reference, decoded, ref_sample_id in best_candidates:
-                                    train_table.add_data(
-                                        reference,
-                                        decoded,
-                                        ref_sample_id,
-                                    )
-                                wandb.log({"train/Translations": train_table}, step=step_idx)
+                            # if train_table is not None:
+                            #     for reference, decoded, ref_sample_id in best_candidates:
+                            #         train_table.add_data(
+                            #             reference,
+                            #             decoded,
+                            #             ref_sample_id,
+                            #         )
+                            #     wandb.log({"train/Translations": train_table}, step=step_idx)
                     # Synchronize and broadcast updated weights to all ranks
                     if _is_dist():
                         dist.barrier()
@@ -443,18 +443,18 @@ def train(config: DictConfig):
 
                     step_idx += 1
 
-                # Refresh reference model on rank 0 at example boundaries
-                if rank == 0:
-                    ref_model = copy.deepcopy(model).to(device)
-                    ref_model.eval()
-                    for p in ref_model.parameters():
-                        p.requires_grad_(False)
-                if _is_dist():
-                    dist.barrier()
-                # Share refreshed weights so next epoch starts synchronized
-                _broadcast_model_(model, src=0)
-                if _is_dist():
-                    dist.barrier()
+            # Refresh reference model on rank 0 at example boundaries
+            if rank == 0:
+                ref_model = copy.deepcopy(model).to(device)
+                ref_model.eval()
+                for p in ref_model.parameters():
+                    p.requires_grad_(False)
+            if _is_dist():
+                dist.barrier()
+            # Share refreshed weights so next epoch starts synchronized
+            _broadcast_model_(model, src=0)
+            if _is_dist():
+                dist.barrier()
 
     if run_eval:
         if _is_dist():
