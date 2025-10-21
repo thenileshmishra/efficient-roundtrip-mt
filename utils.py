@@ -2,7 +2,7 @@ import math
 from typing import Sequence
 
 import torch
-import evaluate
+from sacrebleu.metrics import CHRF
 
 # =========================
 # Distributed GRPO Utilities
@@ -155,25 +155,35 @@ def grpo_compute_loss_and_logs(
     ]
 
     # Compute chrF with evaluate (character order=6) for rewards
-    chrf_metric = evaluate.load("chrf")
+    chrf_metric = CHRF(word_order=2, char_order=6)
     # evaluate returns an average score; we also approximate per-sample by recomputing individually
     rewards = []
-    chrf_scores = []
+    # we compute the chrf++ scores for each prefix of the hypothesis
+    longest_hyp_length = target_ids.size(-1)
+    chrf_mean = 0.0
     for hyp, ref in zip(generated_texts, references):
-        sample = chrf_metric.compute(predictions=[hyp], references=[[ref]], char_order=6, word_order=2)["score"] / 100.0
-        chrf_scores.append(sample)
-        rewards.append(torch.log(torch.tensor(sample + 1e-8, device=device)))
-    chrf_mean = torch.tensor(chrf_scores, device=device).mean()
+        # loop over the tokens in the hypothesis
+        splitted_hyp = tokenizer.tokenize(hyp)
+        prefix_chrf_scores = torch.zeros((longest_hyp_length,), device=device)
+        for prefix_len in range(1, longest_hyp_length+1):
+            prefix_hyp = tokenizer.convert_tokens_to_string(splitted_hyp[:prefix_len])
+            prefix_chrf_scores[prefix_len-1] = chrf_metric.corpus_score(hypotheses=[prefix_hyp], references=[[ref]]).score / 100.0
+        chrf_mean += prefix_chrf_scores[-1]
+        rewards.append(prefix_chrf_scores)
+    # rewards is now a list of tensors, each of shape (num_prefixes, ). we need to reshape back to (B, N, num_prefixes). For example, if it was of length 30, we need to shape back 
+    # the mean of the chrf++ scores should be the mean when the whole hypothesis is considered
     rewards = torch.stack(rewards, dim=0)
-    # reshape back to (B, N)
-    rewards = rewards.reshape(batch_size, num_candidates)
-    # Normalize rewards -> advantages
-    advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-4)
-    # Now, across examples, each token will have a different advantage for each candidate
+    chrf_mean = torch.tensor(chrf_mean / (batch_size * num_candidates), device=device)
+    rewards = rewards.reshape(batch_size, num_candidates, -1)
+    standardized_rewards = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-4)
+    # in process reward based grpo, the process supervision calculates the advantage of each token as the sum of the normalized rewards from the following steps, i.e., ˆ𝐴𝑖,𝑡 = 𝑖𝑛𝑑𝑒𝑥(𝑗)≥𝑡 𝑟𝑖𝑛𝑑𝑒𝑥(𝑗)
+    advantages = torch.zeros_like(rewards)
+    for i in range(batch_size):
+        for j in range(num_candidates):
+            for t in range(rewards.size(2)):
+                advantages[i, j, t] = standardized_rewards[i, j, t:].sum()
     # per_token_logps is (B*N, L), reshape naturally to (B, N, L)
     per_token_logps = per_token_logps.reshape(batch_size, num_candidates, -1)
-    # now, advantages is (B, N, 1), expand it to (B, N, L)
-    advantages = advantages.unsqueeze(-1).expand_as(per_token_logps)
 
     # PPO-style ratio (on-policy baseline trick)
     ratio = torch.exp(per_token_logps - per_token_logps.detach())

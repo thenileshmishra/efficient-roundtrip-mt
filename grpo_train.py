@@ -214,7 +214,7 @@ def train(config: DictConfig):
     if rank == 0:
         wandb.init(
             project="grpo-translation-nllb-multi-domain",
-            name=time.strftime("%Y-%m-%d_%H-%M-%S"),
+            name="25-gradient-steps-600m-outcome-reward-batch-6",
             config=OmegaConf.to_container(config, resolve=True),
             dir = "/root/wandb"
         )

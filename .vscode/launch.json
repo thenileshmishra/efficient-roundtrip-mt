@@ -9,7 +9,7 @@
             "name": "Debug: Train GRPO",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train.py",
+            "program": "${workspaceFolder}/grpo_train.py",
             "console": "integratedTerminal",
             "env": {
                 "TOKENIZERS_PARALLELISM": "true"
