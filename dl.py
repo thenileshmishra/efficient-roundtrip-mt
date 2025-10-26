@@ -8,18 +8,6 @@ from datasets import load_dataset
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
 
-class LengthSortedSampler(Sampler[int]):
-    def __init__(self, lengths, ascending: bool = True):
-        self.lengths = lengths
-        self.indices = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=not ascending)
-
-    def __iter__(self):
-        return iter(self.indices)
-
-    def __len__(self):
-        return len(self.indices)
-
-
 class TranslationDataModule(LightningDataModule):
     def __init__(
         self,
@@ -48,17 +36,6 @@ class TranslationDataModule(LightningDataModule):
         
         self.train_data = TranslationDataPipe(prompts["train"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
         self.val_data = TranslationDataPipe(prompts["valid"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
-
-        # Optional: build a sampler to iterate by increasing source length
-        if self.hparams.sort_by_length:
-            src_col = "sentence_" + self.hparams.source_lang
-            # Compute source lengths once
-            lengths = [
-                len(self.tokenizer(self.train_data.prompts[i][src_col]).input_ids)  # type: ignore[attr-defined]
-                for i in range(len(self.train_data))
-            ]
-            ascending = (self.hparams.sort_direction.lower() != "desc")
-            self._train_sampler = LengthSortedSampler(lengths, ascending=ascending)
 
     def train_dataloader(self):
         if self._train_sampler is not None:
