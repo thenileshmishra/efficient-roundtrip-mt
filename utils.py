@@ -168,7 +168,7 @@ def grpo_compute_loss_and_logs(
         for prefix_len in range(1, longest_hyp_length+1):
             prefix_hyp = tokenizer.convert_tokens_to_string(splitted_hyp[:prefix_len])
             prefix_chrf_scores[prefix_len-1] = chrf_metric.corpus_score(hypotheses=[prefix_hyp], references=[[ref]]).score / 100.0
-        chrf_mean += prefix_chrf_scores[-1]
+        chrf_mean += prefix_chrf_scores[-1].item()
         rewards.append(prefix_chrf_scores)
     # rewards is now a list of tensors, each of shape (num_prefixes, ). we need to reshape back to (B, N, num_prefixes). For example, if it was of length 30, we need to shape back 
     # the mean of the chrf++ scores should be the mean when the whole hypothesis is considered

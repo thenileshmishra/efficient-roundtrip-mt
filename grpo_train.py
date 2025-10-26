@@ -2,7 +2,6 @@ import os
 import copy
 import hydra
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 import wandb
 import evaluate
@@ -17,56 +16,6 @@ from utils import (
     grpo_compute_loss_and_logs,
 )
 from dl import TranslationDataModule
-import time
-
-def _is_dist():
-    return dist.is_available() and dist.is_initialized()
-
-def _get_dist_info():
-    if _is_dist():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    else:
-        rank, world_size, local_rank = 0, 1, 0
-    return rank, world_size, local_rank
-
-
-def _broadcast_model_(model, src: int = 0):
-    if not _is_dist():
-        return
-    for param in model.parameters():
-        dist.broadcast(param.data, src=src)
-    for buf in model.buffers():
-        dist.broadcast(buf.data, src=src)
-
-
-def _broadcast_object(obj, src: int = 0):
-    if not _is_dist():
-        return obj
-    container = [obj if dist.get_rank() == src else None]
-    dist.broadcast_object_list(container, src=src)
-    return container[0]
-
-
-def _pad_and_all_gather_sequences(seqs: torch.Tensor, pad_id: int, device: torch.device):
-    rank, world_size, _ = _get_dist_info()
-    if world_size == 1:
-        return [seqs]
-
-    local_len = torch.tensor([seqs.size(1)], device=device, dtype=torch.int64)
-    max_len = local_len.clone()
-    dist.all_reduce(max_len, op=dist.ReduceOp.MAX)
-    max_len_val = int(max_len.item())
-
-    if seqs.size(1) < max_len_val:
-        pad_width = max_len_val - seqs.size(1)
-        pad_tensor = torch.full((seqs.size(0), pad_width), pad_id, device=seqs.device, dtype=seqs.dtype)
-        seqs = torch.cat([seqs, pad_tensor], dim=1)
-
-    gather_list = [torch.empty_like(seqs) for _ in range(world_size)]
-    dist.all_gather(gather_list, seqs)
-    return gather_list
 
 
 def _run_evaluation(
@@ -78,7 +27,6 @@ def _run_evaluation(
     tgt_lang_id: int,
     device: torch.device,
     max_new_tokens: int,
-    rank: int,
 ):
     if eval_cfg is None:
         return {}
@@ -88,10 +36,6 @@ def _run_evaluation(
         requested_metrics = [requested_metrics]
     requested_metrics = [metric.lower() for metric in requested_metrics]
 
-    # Only rank 0 performs evaluation to avoid duplicated work.
-    if rank != 0:
-        return {}
-
     was_training = model.training
     model.eval()
 
@@ -100,7 +44,7 @@ def _run_evaluation(
     references = []
     sample_records = []
 
-    # Progress bar setup (rank 0 only)
+    # Progress bar setup
     try:
         total_batches = len(val_loader)
     except TypeError:
@@ -186,19 +130,8 @@ def _run_evaluation(
 @hydra.main(version_base=None, config_path="./configs/", config_name="train")
 def train(config: DictConfig):
     torch.manual_seed(config.seed)
-
-    # Initialize process group if launched with torchrun
-    if dist.is_available() and not dist.is_initialized() and os.environ.get("RANK") is not None:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-
-    rank, world_size, local_rank = _get_dist_info()
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(f"{device_type}:{local_rank}" if device_type == "cuda" else device_type)
-    if device_type == "cuda":
-        torch.cuda.set_device(local_rank)
-
-    # Build model and tokenizer on rank 0, then broadcast weights
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Build model and tokenizer
     model, tokenizer = get_model(config)
     model.to(device)
 
@@ -209,21 +142,20 @@ def train(config: DictConfig):
         run_eval = True
     run_training = not eval_only
 
-    # Initialize Weights & Biases on rank 0
+    # Initialize Weights & Biases
+    wandb.init(
+        project="grpo-translation-nllb-multi-domain",
+        name="25-gradient-steps-600m-outcome-reward-batch-6",
+        config=OmegaConf.to_container(config, resolve=True),
+        dir="/root/wandb",
+    )
     train_table = None
-    if rank == 0:
-        wandb.init(
-            project="grpo-translation-nllb-multi-domain",
-            name="25-gradient-steps-600m-outcome-reward-batch-6",
-            config=OmegaConf.to_container(config, resolve=True),
-            dir = "/root/wandb"
-        )
-        if run_training:
-            train_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
-    # Reference model (frozen) on rank 0
+    if run_training:
+        train_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
+    # Reference model (frozen copy of the policy)
     reference_name = getattr(config.task.model, "reference_name", None)
     ref_model = None
-    if run_training and rank == 0:
+    if run_training:
         if reference_name is not None:
             ref_model = AutoModelForSeq2SeqLM.from_pretrained(
                 reference_name,
@@ -236,14 +168,7 @@ def train(config: DictConfig):
         for p in ref_model.parameters():
             p.requires_grad_(False)
 
-    # Make sure all ranks start from the same initial weights
-    if _is_dist():
-        dist.barrier()
-    _broadcast_model_(model, src=0)
-    if _is_dist():
-        dist.barrier()
-
-    # Data module: only rank 0 pulls batches; others receive via broadcast
+    # Data module
     illegal_token_mask = None
     data = TranslationDataModule(
         tokenizer=tokenizer,
@@ -267,8 +192,8 @@ def train(config: DictConfig):
     clip_param = float(getattr(config.task.training, "clip_param", 0.2))
     tgt_lang_id = tokenizer.convert_tokens_to_ids(config.task.data.target_lang)
 
-    # Optimizer only on rank 0
-    if run_training and rank == 0:
+    # Optimizer setup
+    if run_training:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if not trainable_params:
             raise ValueError("No trainable parameters found for the optimizer.")
@@ -284,41 +209,16 @@ def train(config: DictConfig):
 
     if run_training:
         for epoch in range(max_epochs):
-            if rank == 0:
-                train_loader = data.train_dataloader()
-                data_iter = iter(train_loader)
-
+            train_loader = data.train_dataloader()
             step_idx = 0
-            while True:
-                # Rank 0 pulls next batch and broadcasts, or signals epoch end
-                if rank == 0:
-                    try:
-                        batch = next(data_iter)
-                        # Expect batch = (src_prompt_dict, ground_truth_list, sample_id_list)
-                        src_prompt, ground_truths, sample_ids = batch
-                        # Move batch to CPU for pickling broadcast
-                        src_prompt_cpu = {k: v.cpu() for k, v in src_prompt.items()}
-                        payload = (
-                            src_prompt_cpu,
-                            list(ground_truths),
-                            [int(sid) for sid in sample_ids],
-                        )
-                    except StopIteration:
-                        payload = None
-                else:
-                    payload = None
 
-                payload = _broadcast_object(payload, src=0)
-                if payload is None:
-                    break  # epoch finished
-
-                src_prompt_cpu, ground_truths, sample_ids = payload
-                # Move tensors to this rank's device
-                encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt_cpu.items()}
+            for batch in train_loader:
+                src_prompt, ground_truths, sample_ids = batch
+                encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt.items()}
                 batch_size = encoder_inputs["input_ids"].size(0)
 
                 for _ in range(updates_per_batch):
-                    # Each rank generates sequences with current local model weights
+                    # Generate candidate sequences with current policy
                     generated_local = grpo_generate_sequences(
                         model,
                         tokenizer,
@@ -332,102 +232,84 @@ def train(config: DictConfig):
                         end_of_sentence_token_id=tokenizer.eos_token_id,
                     )
 
-                    # Pad and gather sequences to rank 0
-                    gathered = _pad_and_all_gather_sequences(
-                        generated_local, pad_id=tokenizer.pad_token_id, device=device
+                    seq_len = generated_local.size(1)
+                    try:
+                        generated_all = generated_local.reshape(batch_size, num_return_sequences, seq_len)
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "Unable to reshape generated sequences into (batch_size, num_return_sequences, seq_len). "
+                            f"Batch size={batch_size}, num_return_sequences={num_return_sequences}, seq_len={seq_len}."
+                        ) from exc
+
+                    # Compute GRPO loss and update model
+                    loss, logs = grpo_compute_loss_and_logs(
+                        model,
+                        ref_model,
+                        tokenizer,
+                        encoder_inputs,
+                        generated_all,
+                        ground_truths,
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                        beta=beta,
+                        clip_param=clip_param,
+                        tgt_lang_id=tgt_lang_id,
                     )
 
-                    if rank == 0:
-                        seq_len = gathered[0].size(1)
-                        try:
-                            generated_rank_views = [
-                                tensor.reshape(batch_size, num_return_sequences, seq_len) for tensor in gathered
-                            ]
-                        except RuntimeError as exc:
-                            raise RuntimeError(
-                                "Unable to reshape gathered sequences into (batch_size, num_return_sequences, seq_len). "
-                                f"Batch size={batch_size}, num_return_sequences={num_return_sequences}, seq_len={seq_len}."
-                            ) from exc
-                        generated_all = torch.stack(generated_rank_views, dim=2)  # (B, num_return_sequences, world, L)
-                        generated_all = generated_all.permute(0, 2, 1, 3).reshape(
-                            batch_size, -1, seq_len
-                        )  # (B, world*num_return_sequences, L)
+                    optimizer.zero_grad()
+                    loss.backward()
 
-                        # Compute GRPO loss on rank 0 and update
-                        loss, logs = grpo_compute_loss_and_logs(
-                            model,
-                            ref_model,
-                            tokenizer,
-                            encoder_inputs,
-                            generated_all,
-                            ground_truths,
-                            end_of_sentence_token_id=tokenizer.eos_token_id,
-                            beta=beta,
-                            clip_param=clip_param,
-                            tgt_lang_id=tgt_lang_id,
+                    # Compute gradient L2 norm for logging
+                    grad_norm = 0.0
+                    with torch.no_grad():
+                        grads = [
+                            p.grad.detach().float().norm(2)
+                            for p in model.parameters()
+                            if p.requires_grad and p.grad is not None
+                        ]
+                        if grads:
+                            grad_norm = torch.norm(torch.stack(grads), 2).item()
+
+                    optimizer.step()
+
+                    if step_idx % int(getattr(config.task.training, "log_every_n_steps", 10)) == 0:
+                        print(
+                            f"[epoch {epoch}] step {step_idx} | loss={logs['loss'].item():.4f} "
+                            f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} "
+                            f"chrf={logs['chrf'].item():.4f} gradient_norm={grad_norm:.4f}"
                         )
-
-                        optimizer.zero_grad()
-                        loss.backward()
-
-                        # Compute global gradient L2 norm (rank 0 only)
-                        grad_norm = 0.0
-                        with torch.no_grad():
-                            grads = []
-                            for p in model.parameters():
-                                if p.requires_grad and p.grad is not None:
-                                    grads.append(p.grad.detach().float().norm(2))
-                            if grads:
-                                grad_norm = torch.norm(torch.stack(grads), 2).item()
-
-                        optimizer.step()
-
-                        if step_idx % int(getattr(config.task.training, "log_every_n_steps", 10)) == 0:
-                            print(
-                                f"[epoch {epoch}] step {step_idx} | loss={logs['loss'].item():.4f} "
-                                f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} chrf={logs['chrf'].item():.4f} gradient_norm={grad_norm:.4f}"
+                        # Print the reference and one generated sequence for inspection
+                        best_candidates = []
+                        for idx, reference in enumerate(ground_truths):
+                            decoded = tokenizer.decode(
+                                generated_all[idx, 0], skip_special_tokens=True
                             )
-                            # Print the reference and one generated sequence for inspection
-                            best_candidates = []
-                            for idx, reference in enumerate(ground_truths):
-                                decoded = tokenizer.decode(
-                                    generated_all[idx, 0], skip_special_tokens=True
-                                )
-                                best_candidates.append((reference, decoded, sample_ids[idx]))
-                            ref_text, gen_text, ref_sample_id = best_candidates[0]
-                            print(f"Reference[{ref_sample_id}]: {ref_text}")
-                            print(f"Generated[{ref_sample_id}]: {gen_text}")
+                            best_candidates.append((reference, decoded, sample_ids[idx]))
+                        ref_text, gen_text, ref_sample_id = best_candidates[0]
+                        print(f"Reference[{ref_sample_id}]: {ref_text}")
+                        print(f"Generated[{ref_sample_id}]: {gen_text}")
 
-                            # Log to Weights & Biases on rank 0
-                            wandb.log(
-                                {
-                                    "train/loss": float(logs["loss"].item()),
-                                    "train/kl": float(logs["kl"].item()),
-                                    "train/chrf": float(logs["chrf"].item()),
-                                    "train/gradient_norm": float(grad_norm),
-                                }
-                            )
-                            # if train_table is not None:
-                            #     for reference, decoded, ref_sample_id in best_candidates:
-                            #         train_table.add_data(
-                            #             reference,
-                            #             decoded,
-                            #             ref_sample_id,
-                            #         )
-                            #     wandb.log({"train/Translations": train_table}, step=step_idx)
-                    # Synchronize and broadcast updated weights to all ranks
-                    if _is_dist():
-                        dist.barrier()
-                    _broadcast_model_(model, src=0)
-                    if _is_dist():
-                        dist.barrier()
+                        # Log to Weights & Biases
+                        wandb.log(
+                            {
+                                "train/loss": float(logs["loss"].item()),
+                                "train/kl": float(logs["kl"].item()),
+                                "train/chrf": float(logs["chrf"].item()),
+                                "train/gradient_norm": float(grad_norm),
+                            }
+                        )
+                        # if train_table is not None:
+                        #     for reference, decoded, ref_sample_id in best_candidates:
+                        #         train_table.add_data(
+                        #             reference,
+                        #             decoded,
+                        #             ref_sample_id,
+                        #         )
+                        #     wandb.log({"train/Translations": train_table}, step=step_idx)
 
-                    # Optional periodic evaluation every N updates (rank 0 performs work)
+                    # Optional periodic evaluation every N updates
                     if run_eval:
                         eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
                         if eval_every_n_batches > 0 and step_idx > 0 and (step_idx % eval_every_n_batches == 0):
-                            if _is_dist():
-                                dist.barrier()
                             _run_evaluation(
                                 model,
                                 tokenizer,
@@ -436,29 +318,17 @@ def train(config: DictConfig):
                                 tgt_lang_id=tgt_lang_id,
                                 device=device,
                                 max_new_tokens=max_new_tokens,
-                                rank=rank,
                             )
-                            if _is_dist():
-                                dist.barrier()
 
                     step_idx += 1
 
-            # Refresh reference model on rank 0 at example boundaries
-            if rank == 0:
-                ref_model = copy.deepcopy(model).to(device)
-                ref_model.eval()
-                for p in ref_model.parameters():
-                    p.requires_grad_(False)
-            if _is_dist():
-                dist.barrier()
-            # Share refreshed weights so next epoch starts synchronized
-            _broadcast_model_(model, src=0)
-            if _is_dist():
-                dist.barrier()
+            # Refresh reference model at epoch boundaries
+            ref_model = copy.deepcopy(model).to(device)
+            ref_model.eval()
+            for p in ref_model.parameters():
+                p.requires_grad_(False)
 
     if run_eval:
-        if _is_dist():
-            dist.barrier()
         _run_evaluation(
             model,
             tokenizer,
@@ -467,19 +337,16 @@ def train(config: DictConfig):
             tgt_lang_id=tgt_lang_id,
             device=device,
             max_new_tokens=max_new_tokens,
-            rank=rank,
         )
-        if _is_dist():
-            dist.barrier()
 
-    # Save final model from rank 0 only when training occurred
-    if run_training and rank == 0:
+    # Save final model when training occurred
+    if run_training:
         save_dir = os.path.join(os.getcwd(), "model")
         os.makedirs(save_dir, exist_ok=True)
         model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
 
-    if rank == 0 and wandb.run is not None:
+    if wandb.run is not None:
         wandb.finish()
 
 
