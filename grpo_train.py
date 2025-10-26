@@ -66,7 +66,10 @@ def _run_evaluation(
     with torch.no_grad():
         with tqdm(total=total_batches, desc="Evaluating", leave=False) as pbar:
             for idx, batch in enumerate(val_loader):
-                encoder_inputs, ground_truths, sample_ids = batch
+                if len(batch) == 4:
+                    encoder_inputs, ground_truths, _, sample_ids = batch
+                else:
+                    encoder_inputs, ground_truths, sample_ids = batch
                 if isinstance(ground_truths, str):
                     ground_truths = [ground_truths]
                 else:
@@ -135,6 +138,39 @@ def train(config: DictConfig):
     model, tokenizer = get_model(config)
     model.to(device)
 
+    source_lang_code = config.task.data.source_lang
+    target_lang_code = config.task.data.target_lang
+    if hasattr(tokenizer, "src_lang"):
+        tokenizer.src_lang = source_lang_code
+    if hasattr(tokenizer, "tgt_lang"):
+        tokenizer.tgt_lang = target_lang_code
+
+    def _tokenize_with_lang(texts, src_lang):
+        if isinstance(texts, str):
+            texts = [texts]
+        previous_src_lang = getattr(tokenizer, "src_lang", None)
+        if previous_src_lang is not None:
+            tokenizer.src_lang = src_lang
+        encoded = tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        if previous_src_lang is not None:
+            tokenizer.src_lang = previous_src_lang
+        return encoded
+
+    def _compute_grad_norm():
+        grads = [
+            p.grad.detach().float().norm(2)
+            for p in model.parameters()
+            if p.requires_grad and p.grad is not None
+        ]
+        if not grads:
+            return 0.0
+        return torch.norm(torch.stack(grads), 2).item()
+
     eval_cfg = getattr(config.task, "eval", None)
     eval_only = bool(getattr(eval_cfg, "only", False)) if eval_cfg is not None else False
     run_eval = bool(getattr(eval_cfg, "run", False)) if eval_cfg is not None else False
@@ -190,7 +226,8 @@ def train(config: DictConfig):
     gen_temperature = float(getattr(config.task.training, "gen_temperature", 1.3))
     beta = float(getattr(config.task.training, "beta", 0.04))
     clip_param = float(getattr(config.task.training, "clip_param", 0.2))
-    tgt_lang_id = tokenizer.convert_tokens_to_ids(config.task.data.target_lang)
+    tgt_lang_id = tokenizer.convert_tokens_to_ids(target_lang_code)
+    src_lang_id = tokenizer.convert_tokens_to_ids(source_lang_code)
 
     # Optimizer setup
     if run_training:
@@ -213,7 +250,7 @@ def train(config: DictConfig):
             step_idx = 0
 
             for batch in train_loader:
-                src_prompt, ground_truths, sample_ids = batch
+                src_prompt, ground_truths, source_texts, sample_ids = batch
                 encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt.items()}
                 batch_size = encoder_inputs["input_ids"].size(0)
 
@@ -242,7 +279,7 @@ def train(config: DictConfig):
                         ) from exc
 
                     # Compute GRPO loss and update model
-                    loss, logs = grpo_compute_loss_and_logs(
+                    loss_forward, logs_forward = grpo_compute_loss_and_logs(
                         model,
                         ref_model,
                         tokenizer,
@@ -256,26 +293,83 @@ def train(config: DictConfig):
                     )
 
                     optimizer.zero_grad()
-                    loss.backward()
+                    loss_forward.backward()
+                    forward_grad_norm = _compute_grad_norm()
+                    optimizer.step()
 
-                    # Compute gradient L2 norm for logging
-                    grad_norm = 0.0
-                    with torch.no_grad():
-                        grads = [
-                            p.grad.detach().float().norm(2)
-                            for p in model.parameters()
-                            if p.requires_grad and p.grad is not None
-                        ]
-                        if grads:
-                            grad_norm = torch.norm(torch.stack(grads), 2).item()
+                    # Prepare backward direction prompts from generated target sentences
+                    forward_generated_flat = generated_all.reshape(
+                        batch_size * num_return_sequences, seq_len
+                    )
+                    forward_prompt_texts = tokenizer.batch_decode(
+                        forward_generated_flat, skip_special_tokens=True
+                    )
+                    backward_inputs_encoded = _tokenize_with_lang(
+                        forward_prompt_texts, target_lang_code
+                    )
+                    backward_inputs = {
+                        k: v.to(device, non_blocking=True)
+                        for k, v in backward_inputs_encoded.items()
+                    }
+                    backward_batch_size = backward_inputs["input_ids"].size(0)
+                    generated_backward = grpo_generate_sequences(
+                        model,
+                        tokenizer,
+                        backward_inputs,
+                        src_lang_id,
+                        max_new_tokens=max_new_tokens,
+                        gen_temperature=gen_temperature,
+                        num_return_sequences=num_return_sequences,
+                        top_k=int(getattr(config.task.training, "top_k", 100)),
+                        top_p=float(getattr(config.task.training, "top_p", 0.95)),
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                    )
 
+                    back_seq_len = generated_backward.size(1)
+                    try:
+                        generated_backward_all = generated_backward.reshape(
+                            backward_batch_size, num_return_sequences, back_seq_len
+                        )
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "Unable to reshape backward generated sequences into "
+                            "(batch_size, num_return_sequences, seq_len). "
+                            f"Batch size={backward_batch_size}, num_return_sequences={num_return_sequences}, "
+                            f"seq_len={back_seq_len}."
+                        ) from exc
+
+                    expanded_source_texts = [
+                        source_texts[idx // num_return_sequences]
+                        for idx in range(backward_batch_size)
+                    ]
+
+                    loss_backward, logs_backward = grpo_compute_loss_and_logs(
+                        model,
+                        ref_model,
+                        tokenizer,
+                        backward_inputs,
+                        generated_backward_all,
+                        expanded_source_texts,
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                        beta=beta,
+                        clip_param=clip_param,
+                        tgt_lang_id=src_lang_id,
+                    )
+
+                    optimizer.zero_grad()
+                    loss_backward.backward()
+                    backward_grad_norm = _compute_grad_norm()
                     optimizer.step()
 
                     if step_idx % int(getattr(config.task.training, "log_every_n_steps", 10)) == 0:
                         print(
-                            f"[epoch {epoch}] step {step_idx} | loss={logs['loss'].item():.4f} "
-                            f"kl={logs['kl'].item():.4f} reward={logs['reward'].item():.4f} "
-                            f"chrf={logs['chrf'].item():.4f} gradient_norm={grad_norm:.4f}"
+                            f"[epoch {epoch}] step {step_idx} | "
+                            f"f_loss={logs_forward['loss'].item():.4f} "
+                            f"f_kl={logs_forward['kl'].item():.4f} f_reward={logs_forward['reward'].item():.4f} "
+                            f"f_chrf={logs_forward['chrf'].item():.4f} f_grad={forward_grad_norm:.4f} | "
+                            f"b_loss={logs_backward['loss'].item():.4f} "
+                            f"b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} "
+                            f"b_chrf={logs_backward['chrf'].item():.4f} b_grad={backward_grad_norm:.4f}"
                         )
                         # Print the reference and one generated sequence for inspection
                         best_candidates = []
@@ -283,18 +377,29 @@ def train(config: DictConfig):
                             decoded = tokenizer.decode(
                                 generated_all[idx, 0], skip_special_tokens=True
                             )
-                            best_candidates.append((reference, decoded, sample_ids[idx]))
-                        ref_text, gen_text, ref_sample_id = best_candidates[0]
+                            best_candidates.append((reference, decoded, source_texts[idx], sample_ids[idx]))
+                        ref_text, gen_text, src_text, ref_sample_id = best_candidates[0]
+                        print(f"Source[{ref_sample_id}]: {src_text}")
                         print(f"Reference[{ref_sample_id}]: {ref_text}")
                         print(f"Generated[{ref_sample_id}]: {gen_text}")
+                        back_best = tokenizer.decode(
+                            generated_backward_all[0, 0], skip_special_tokens=True
+                        )
+                        print(f"Back-Generated[{ref_sample_id}]: {back_best}")
 
                         # Log to Weights & Biases
                         wandb.log(
                             {
-                                "train/loss": float(logs["loss"].item()),
-                                "train/kl": float(logs["kl"].item()),
-                                "train/chrf": float(logs["chrf"].item()),
-                                "train/gradient_norm": float(grad_norm),
+                                "train/forward_loss": float(logs_forward["loss"].item()),
+                                "train/forward_kl": float(logs_forward["kl"].item()),
+                                "train/forward_chrf": float(logs_forward["chrf"].item()),
+                                "train/forward_reward": float(logs_forward["reward"].item()),
+                                "train/forward_gradient_norm": float(forward_grad_norm),
+                                "train/backward_loss": float(logs_backward["loss"].item()),
+                                "train/backward_kl": float(logs_backward["kl"].item()),
+                                "train/backward_chrf": float(logs_backward["chrf"].item()),
+                                "train/backward_reward": float(logs_backward["reward"].item()),
+                                "train/backward_gradient_norm": float(backward_grad_norm),
                             }
                         )
                         # if train_table is not None:
