@@ -94,10 +94,10 @@ class TranslationDataPipe(MapDataPipe):
         return len(self.prompts)
 
     def __getitem__(self, index):
-        src_text = self.prompts[5][self.src_col]
+        src_text = self.prompts[index][self.src_col]
         src_prompt = self.tokenizer(
             src_text,
             return_tensors="pt",
         )
-        str_tgt_prompt = self.prompts[5][self.tgt_col]
-        return src_prompt, str_tgt_prompt, src_text, 5
+        str_tgt_prompt = self.prompts[index][self.tgt_col]
+        return src_prompt, str_tgt_prompt, src_text, index
