@@ -12,7 +12,8 @@
             "program": "${workspaceFolder}/grpo_train.py",
             "console": "integratedTerminal",
             "env": {
-                "TOKENIZERS_PARALLELISM": "true"
+                "TOKENIZERS_PARALLELISM": "true",
+                "CUDA_VISIBLE_DEVICES": "1"
             },
             "justMyCode": false
         },

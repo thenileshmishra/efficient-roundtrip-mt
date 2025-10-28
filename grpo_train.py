@@ -178,7 +178,7 @@ def train(config: DictConfig):
     # Initialize Weights & Biases
     wandb.init(
         project="grpo-translation-nllb-multi-domain",
-        name="25-gradient-steps-600m-outcome-reward-batch-6",
+        name="50-gradient-steps-1.3B-outcome-reward-batch-1-src-tgt-src",
         config=OmegaConf.to_container(config, resolve=True),
         dir="/root/wandb",
     )
@@ -247,6 +247,19 @@ def train(config: DictConfig):
             step_idx = 0
 
             for batch in train_loader:
+                # Optional periodic evaluation every N updates
+                if run_eval:
+                    eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
+                    if eval_every_n_batches > 0 and (step_idx % eval_every_n_batches == 0):
+                        _run_evaluation(
+                            model,
+                            tokenizer,
+                            data,
+                            eval_cfg,
+                            tgt_lang_id=tgt_lang_id,
+                            device=device,
+                            max_new_tokens=max_new_tokens,
+                        )
                 src_prompt, ground_truths, source_texts, sample_ids = batch
                 encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt.items()}
                 batch_size = encoder_inputs["input_ids"].size(0)
@@ -408,19 +421,6 @@ def train(config: DictConfig):
                         #         )
                         #     wandb.log({"train/Translations": train_table}, step=step_idx)
 
-                    # Optional periodic evaluation every N updates
-                    if run_eval:
-                        eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
-                        if eval_every_n_batches > 0 and step_idx > 0 and (step_idx % eval_every_n_batches == 0):
-                            _run_evaluation(
-                                model,
-                                tokenizer,
-                                data,
-                                eval_cfg,
-                                tgt_lang_id=tgt_lang_id,
-                                device=device,
-                                max_new_tokens=max_new_tokens,
-                            )
 
                     step_idx += 1
 
@@ -460,7 +460,7 @@ def get_model(config: DictConfig):
         model_cfg.name,
     )
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_cfg.name, attn_implementation="flash_attention_2", dtype=torch.bfloat16
+        model_cfg.name,
     )
 
     use_lora = bool(getattr(model_cfg, "use_lora", False))

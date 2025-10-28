@@ -63,20 +63,11 @@ class TranslationDataModule(LightningDataModule):
         )
 
     def _collate_batch(self, batch):
-        encoder_inputs_list, targets, sources, sample_ids = zip(*batch)
-        prepared_inputs = []
-        for inputs in encoder_inputs_list:
-            item = {}
-            for key, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    squeezed = value.squeeze(0)
-                    item[key] = squeezed.tolist() if squeezed.ndim == 1 else squeezed
-                else:
-                    item[key] = value
-            prepared_inputs.append(item)
-        batch_encoding = self.tokenizer.pad(
-            prepared_inputs,
+        encoder_texts, targets, sources, sample_ids = zip(*batch)
+        batch_encoding = self.tokenizer(
+            list(encoder_texts),
             padding=True,
+            truncation=True,
             return_tensors="pt",
         )
         return batch_encoding, list(targets), list(sources), list(sample_ids)
@@ -95,9 +86,5 @@ class TranslationDataPipe(MapDataPipe):
 
     def __getitem__(self, index):
         src_text = self.prompts[index][self.src_col]
-        src_prompt = self.tokenizer(
-            src_text,
-            return_tensors="pt",
-        )
-        str_tgt_prompt = self.prompts[index][self.tgt_col]
-        return src_prompt, str_tgt_prompt, src_text, index
+        tgt_text = self.prompts[index][self.tgt_col]
+        return src_text, tgt_text, src_text, index
