@@ -25,8 +25,8 @@ training:
   epochs: 10
   batch_size: 1
   num_return_sequences: 4
-  updates_per_batch: 30
-  gen_temperature: 2.0
+  updates_per_batch: 1000
+  gen_temperature: 1.5
   beta: 0.04
   clip_param: 0.2
   top_k: 100
