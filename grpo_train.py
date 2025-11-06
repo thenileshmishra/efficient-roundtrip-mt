@@ -176,9 +176,11 @@ def train(config: DictConfig):
     run_training = not eval_only
 
     # Initialize Weights & Biases
+    model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
+    run_name = f"grpo_{model_name_for_run}_process_reward_batch_1_src_tgt_src_grad_accum"
     wandb.init(
         project="grpo-translation-nllb-multi-domain",
-        name="50-gradient-steps-1.3B-outcome-reward-batch-1-src-tgt-src",
+        name=run_name,
         config=OmegaConf.to_container(config, resolve=True),
         dir="/root/wandb",
     )
@@ -304,8 +306,7 @@ def train(config: DictConfig):
 
                     optimizer.zero_grad()
                     loss_forward.backward()
-                    forward_grad_norm = _compute_grad_norm()
-                    optimizer.step()
+
 
                     # Prepare backward direction prompts from generated target sentences
                     forward_generated_flat = generated_all.reshape(
@@ -366,9 +367,9 @@ def train(config: DictConfig):
                         tgt_lang_id=src_lang_id,
                     )
 
-                    optimizer.zero_grad()
+
                     loss_backward.backward()
-                    backward_grad_norm = _compute_grad_norm()
+                    grad_norm = _compute_grad_norm()
                     optimizer.step()
 
                     if step_idx % int(getattr(config.task.training, "log_every_n_steps", 10)) == 0:
@@ -376,10 +377,10 @@ def train(config: DictConfig):
                             f"[epoch {epoch}] step {step_idx} | "
                             f"f_loss={logs_forward['loss'].item():.4f} "
                             f"f_kl={logs_forward['kl'].item():.4f} f_reward={logs_forward['reward'].item():.4f} "
-                            f"f_chrf={logs_forward['chrf'].item():.4f} f_grad={forward_grad_norm:.4f} | "
+                            f"f_chrf={logs_forward['chrf'].item():.4f} | "
                             f"b_loss={logs_backward['loss'].item():.4f} "
                             f"b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} "
-                            f"b_chrf={logs_backward['chrf'].item():.4f} b_grad={backward_grad_norm:.4f}"
+                            f"b_chrf={logs_backward['chrf'].item():.4f} grad_norm={grad_norm:.4f}"
                         )
                         # Print the reference and one generated sequence for inspection
                         best_candidates = []
@@ -404,12 +405,11 @@ def train(config: DictConfig):
                                 "train/forward_kl": float(logs_forward["kl"].item()),
                                 "train/forward_chrf": float(logs_forward["chrf"].item()),
                                 "train/forward_reward": float(logs_forward["reward"].item()),
-                                "train/forward_gradient_norm": float(forward_grad_norm),
                                 "train/backward_loss": float(logs_backward["loss"].item()),
                                 "train/backward_kl": float(logs_backward["kl"].item()),
                                 "train/backward_chrf": float(logs_backward["chrf"].item()),
                                 "train/backward_reward": float(logs_backward["reward"].item()),
-                                "train/backward_gradient_norm": float(backward_grad_norm),
+                                "train/grad_norm": float(grad_norm),
                             }
                         )
                         # if train_table is not None:
@@ -460,7 +460,7 @@ def get_model(config: DictConfig):
         model_cfg.name,
     )
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_cfg.name,
+        model_cfg.name
     )
 
     use_lora = bool(getattr(model_cfg, "use_lora", False))

@@ -82,6 +82,7 @@ def grpo_compute_decoder_per_token_logps(
         use_cache=False,
     )
     logits = outputs.logits  # (B, L, V)
+    del outputs
     per_token_logps = _gather_log_probs_from_logits_logits(logits, target_ids)  # (B, L)
     return per_token_logps
 
