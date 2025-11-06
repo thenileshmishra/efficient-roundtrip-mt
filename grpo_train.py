@@ -174,10 +174,13 @@ def train(config: DictConfig):
     if eval_only:
         run_eval = True
     run_training = not eval_only
+    eval_every_n_batches = 0
+    if run_eval and eval_cfg is not None:
+        eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
 
     # Initialize Weights & Biases
     model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
-    run_name = f"grpo_{model_name_for_run}_process_reward_batch_1_src_tgt_src_grad_accum"
+    run_name = f"grpo_{model_name_for_run}_outcome_reward_batch_{config.task.training.batch_size}_src_tgt_grad_accum_length_penalty"
     run_wandb = bool(getattr(config.task.training, "use_wandb", True))
     if run_wandb:
         wandb.init(
@@ -258,23 +261,10 @@ def train(config: DictConfig):
             step_idx = 0
 
             for batch in train_loader:
-                # Optional periodic evaluation every N updates
-                if run_eval:
-                    eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
-                    if eval_every_n_batches > 0 and (step_idx % eval_every_n_batches == 0):
-                        _run_evaluation(
-                            model,
-                            tokenizer,
-                            data,
-                            eval_cfg,
-                            tgt_lang_id=tgt_lang_id,
-                            device=device,
-                            max_new_tokens=max_new_tokens,
-                        )
                 src_prompt, ground_truths, source_texts, sample_ids = batch
                 encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt.items()}
                 batch_size = encoder_inputs["input_ids"].size(0)
-
+            
                 # Generate candidate sequences with current policy
                 generated_local = grpo_generate_sequences(
                     model,
@@ -310,12 +300,12 @@ def train(config: DictConfig):
                     beta=beta,
                     clip_param=clip_param,
                     tgt_lang_id=tgt_lang_id,
+                    length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
                 )
-
+                
                 loss_scale = 1.0 / float(grad_accum_steps)
-                (loss_forward * loss_scale).backward()
-
-
+                loss_forward = loss_forward * loss_scale
+                loss_forward.backward()
                 # Prepare backward direction prompts from generated target sentences
                 forward_generated_flat = generated_all.reshape(
                     batch_size * num_return_sequences, seq_len
@@ -373,12 +363,11 @@ def train(config: DictConfig):
                     beta=beta,
                     clip_param=clip_param,
                     tgt_lang_id=src_lang_id,
-                    length_penalty_weight=float(getattr(config.task.training, "length_penalty_weight", 0.0)),
+                    length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
                 )
 
-
+                loss_scale = 1.0 / float(grad_accum_steps)
                 (loss_backward * loss_scale).backward()
-
                 accum_steps_since_update += 1
                 performed_optimizer_step = False
                 grad_norm = None
@@ -390,15 +379,24 @@ def train(config: DictConfig):
                     optimizer_step += 1
                     performed_optimizer_step = True
 
+                if performed_optimizer_step or (optimizer_step == 0):
+                    if run_eval and eval_every_n_batches > 0 and (optimizer_step % eval_every_n_batches == 0):
+                        _run_evaluation(
+                            model,
+                            tokenizer,
+                            data,
+                            eval_cfg,
+                            tgt_lang_id=tgt_lang_id,
+                            device=device,
+                            max_new_tokens=max_new_tokens,
+                        )
+
                 if performed_optimizer_step and (optimizer_step % log_every_n_steps == 0):
                     print(
                         f"[epoch {epoch}] step {step_idx} (opt {optimizer_step}) | "
                         f"f_loss={logs_forward['loss'].item():.4f} "
                         f"f_kl={logs_forward['kl'].item():.4f} f_reward={logs_forward['reward'].item():.4f} "
-                        f"f_chrf={logs_forward['chrf'].item():.4f} | length_penalty={logs_forward['length_penalty'].item():.4f} | "
-                        f"b_loss={logs_backward['loss'].item():.4f} "
-                        f"b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} "
-                        f"b_chrf={logs_backward['chrf'].item():.4f} b_length_penalty={logs_backward['length_penalty'].item():.4f} | grad_norm={grad_norm:.4f}"
+                        f"f_chrf={logs_forward['chrf'].item():.4f} | length_penalty={logs_forward['length_penalty'].item():.4f} | grad_norm={grad_norm:.4f} b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} b_length_penalty={logs_backward['length_penalty'].item():.4f} b_grad_norm={grad_norm:.4f}"
                     )
                     # Print the reference and one generated sequence for inspection
                     best_candidates = []
@@ -406,14 +404,14 @@ def train(config: DictConfig):
                         decoded = tokenizer.decode(
                             generated_all[idx, 0], skip_special_tokens=True
                         )
-                        best_candidates.append((reference, decoded, source_texts[idx], sample_ids[idx]))
-                    ref_text, gen_text, src_text, ref_sample_id = best_candidates[0]
+                        best_candidates.append((reference, decoded, sample_ids[idx]))
+                    ref_text, gen_text, src_text,ref_sample_id = best_candidates[0]
                     print(f"Source[{ref_sample_id}]: {src_text}")
                     print(f"Reference[{ref_sample_id}]: {ref_text}")
                     print(f"Generated[{ref_sample_id}]: {gen_text}")
                     back_best = tokenizer.decode(
-                        generated_backward_all[0, 0], skip_special_tokens=True
-                    )
+                            generated_backward_all[0, 0], skip_special_tokens=True
+                        )
                     print(f"Back-Generated[{ref_sample_id}]: {back_best}")
                     if run_wandb:
                         # Log to Weights & Biases
@@ -423,11 +421,12 @@ def train(config: DictConfig):
                                 "train/forward_kl": float(logs_forward["kl"].item()),
                                 "train/forward_chrf": float(logs_forward["chrf"].item()),
                                 "train/forward_reward": float(logs_forward["reward"].item()),
+                                "train/forward_grad_norm": float(grad_norm),
                                 "train/backward_loss": float(logs_backward["loss"].item()),
                                 "train/backward_kl": float(logs_backward["kl"].item()),
                                 "train/backward_chrf": float(logs_backward["chrf"].item()),
                                 "train/backward_reward": float(logs_backward["reward"].item()),
-                                "train/grad_norm": float(grad_norm),
+                                "train/backward_grad_norm": float(grad_norm),
                             }
                         )
                     # if train_table is not None:
@@ -438,16 +437,23 @@ def train(config: DictConfig):
                     #             ref_sample_id,
                     #         )
                     #     wandb.log({"train/Translations": train_table}, step=step_idx)
-
-
                 step_idx += 1
-
             if accum_steps_since_update > 0:
                 grad_norm = _compute_grad_norm()
                 optimizer.step()
                 optimizer.zero_grad()
                 accum_steps_since_update = 0
                 optimizer_step += 1
+                if run_eval and eval_every_n_batches > 0 and (optimizer_step % eval_every_n_batches == 0):
+                    _run_evaluation(
+                        model,
+                        tokenizer,
+                        data,
+                        eval_cfg,
+                        tgt_lang_id=tgt_lang_id,
+                        device=device,
+                        max_new_tokens=max_new_tokens,
+                    )
 
             # Refresh reference model at epoch boundaries
             ref_model = copy.deepcopy(model).to(device)
