@@ -20,24 +20,24 @@ model:
       - v_proj
 
 training:
-  lr: 0.000001
-  accumulate_grad_batches: 8
+  lr: 0.000002
+  accumulate_grad_batches: 16
   epochs: 10
-  batch_size: 1
-  num_return_sequences: 32
+  batch_size: 2
+  num_return_sequences: 4
   updates_per_batch: 1000
   gen_temperature: 1.8
   beta: 0.04
   clip_param: 0.2
   top_k: 100
   top_p: 0.95
-  use_wandb: false
+  use_wandb: true
 
 eval:
-  run: false
+  run: true
   only: false
   translation_metric: ["chrf++"]
-  every_n_batches: 50
+  every_n_batches: 10
 
 reward:
   # MT reward settings (BLEU and chrF++)
