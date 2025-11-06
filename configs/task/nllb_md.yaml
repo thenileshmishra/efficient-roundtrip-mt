@@ -7,8 +7,8 @@ data:
   dataset_config_name: "eng_Latn-ayr_Latn"
 
 model:
-  name: "facebook/nllb-200-distilled-1.3B"
-  # name: "facebook/nllb-200-distilled-600M"
+  # name: "facebook/nllb-200-distilled-1.3B"
+  name: "facebook/nllb-200-distilled-600M"
   # name: "facebook/nllb-200-3.3B"
   use_lora: false
   lora:
@@ -21,29 +21,30 @@ model:
 
 training:
   lr: 0.000001
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 8
   epochs: 10
   batch_size: 1
-  num_return_sequences: 4
+  num_return_sequences: 32
   updates_per_batch: 1000
-  gen_temperature: 1.5
+  gen_temperature: 1.8
   beta: 0.04
   clip_param: 0.2
   top_k: 100
   top_p: 0.95
+  use_wandb: false
 
 eval:
-  run: true
+  run: false
   only: false
   translation_metric: ["chrf++"]
   every_n_batches: 50
 
 reward:
   # MT reward settings (BLEU and chrF++)
-  bleu_weight: 0.5  # Weight for BLEU score
+  bleu_weight: 0.0  # Weight for BLEU score
   chrf_weight: 0.5  # Weight for chrF++ score
-
+  length_penalty_weight: 0.2
 
 constraints:
   min_sentence_len: 1
-  max_sentence_len: 64
+  max_sentence_len: 63 # excluding first eos and langid tokens

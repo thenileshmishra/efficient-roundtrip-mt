@@ -99,6 +99,7 @@ def grpo_compute_loss_and_logs(
     beta: float,
     clip_param: float,
     tgt_lang_id: int,
+    length_penalty_weight: float = 0.0,
 ):
     if isinstance(ground_truths, str):
         ground_truths = [ground_truths]
@@ -158,14 +159,27 @@ def grpo_compute_loss_and_logs(
     # Compute chrF with evaluate (character order=6) for outcome rewards
     chrf_metric = CHRF(word_order=2, char_order=6)
     chrf_scores = []
+    adjusted_scores = []
+    length_penalties = []
     for hyp, ref in zip(generated_texts, references):
         score = (
             chrf_metric.corpus_score(hypotheses=[hyp], references=[[ref]]).score / 100.0
         )
+        if length_penalty_weight > 0:
+            hyp_ids = tokenizer.encode(hyp, add_special_tokens=False)
+            ref_ids = tokenizer.encode(ref, add_special_tokens=False)
+            ref_len = max(len(ref_ids), 1)
+            length_diff = abs(len(hyp_ids) - len(ref_ids)) / ref_len
+            penalty = length_penalty_weight * length_diff
+        else:
+            penalty = 0.0
         chrf_scores.append(score)
+        adjusted_scores.append(score - penalty)
+        length_penalties.append(penalty)
     chrf_scores_tensor = torch.tensor(chrf_scores, device=device)
     chrf_mean = chrf_scores_tensor.mean()
-    rewards = chrf_scores_tensor.reshape(batch_size, num_candidates)
+    adjusted_scores_tensor = torch.tensor(adjusted_scores, device=device)
+    rewards = adjusted_scores_tensor.reshape(batch_size, num_candidates)
     standardized_rewards = (rewards - rewards.mean(dim=1, keepdim=True)) / (
         rewards.std(dim=1, keepdim=True) + 1e-4
     )
@@ -200,5 +214,6 @@ def grpo_compute_loss_and_logs(
         "kl": kl_mean.detach(),
         "reward": rewards.mean().detach(),
         "chrf": chrf_mean.detach(),
+        "length_penalty": torch.tensor(length_penalties, device=device).mean().detach(),
     }
     return loss, logs
