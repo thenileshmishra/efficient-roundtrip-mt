@@ -10,6 +10,8 @@ from tqdm.auto import tqdm
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
+    AutoConfig,
+    AutoModelForCausalLM,
 )
 from lora_utils import apply_lora
 from utils import (
@@ -130,11 +132,26 @@ def _run_evaluation(
 @hydra.main(version_base=None, config_path="./configs/", config_name="train")
 def train(config: DictConfig):
     torch.manual_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device mapping: policy (NLLB) on cuda:1, reference+goldfish on cuda:0
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        aux_device = torch.device("cuda:0")
+        policy_device = torch.device("cuda:1")
+    else:
+        # Fallback to single GPU/CPU
+        aux_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        policy_device = aux_device
     # Build model and tokenizer
     model, tokenizer = get_model(config)
-    model.to(device)
-
+    model.to(policy_device)
+    # Perplexity model for rewarding the generated sequences
+    perplexity_config = AutoConfig.from_pretrained(f"goldfish-models/{config.task.data.target_lang}_full")
+    perplexity_model = AutoModelForCausalLM.from_pretrained(
+        f"goldfish-models/{config.task.data.target_lang}_full", config=perplexity_config
+    )
+    perplexity_tokenizer = AutoTokenizer.from_pretrained(
+        f"goldfish-models/{config.task.data.target_lang}_full"
+    )
+    perplexity_model.to(aux_device)
     source_lang_code = config.task.data.source_lang
     target_lang_code = config.task.data.target_lang
     if hasattr(tokenizer, "src_lang"):
@@ -201,9 +218,9 @@ def train(config: DictConfig):
                 reference_name,
                 attn_implementation="flash_attention_2",
                 dtype=model.dtype,
-            ).to(device)
+            ).to(aux_device)
         else:
-            ref_model = copy.deepcopy(model).to(device)
+            ref_model = copy.deepcopy(model).to(aux_device)
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad_(False)
@@ -262,7 +279,7 @@ def train(config: DictConfig):
 
             for batch in train_loader:
                 src_prompt, ground_truths, source_texts, sample_ids = batch
-                encoder_inputs = {k: v.to(device, non_blocking=True) for k, v in src_prompt.items()}
+                encoder_inputs = {k: v.to(policy_device, non_blocking=True) for k, v in src_prompt.items()}
                 batch_size = encoder_inputs["input_ids"].size(0)
             
                 # Generate candidate sequences with current policy
@@ -301,6 +318,9 @@ def train(config: DictConfig):
                     clip_param=clip_param,
                     tgt_lang_id=tgt_lang_id,
                     length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
+                    goldfish_model=perplexity_model,
+                    goldfish_tokenizer=perplexity_tokenizer,
+                    goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
                 )
                 
                 loss_scale = 1.0 / float(grad_accum_steps)
@@ -317,7 +337,7 @@ def train(config: DictConfig):
                     forward_prompt_texts, target_lang_code
                 )
                 backward_inputs = {
-                    k: v.to(device, non_blocking=True)
+                    k: v.to(policy_device, non_blocking=True)
                     for k, v in backward_inputs_encoded.items()
                 }
                 backward_batch_size = backward_inputs["input_ids"].size(0)
@@ -364,6 +384,9 @@ def train(config: DictConfig):
                     clip_param=clip_param,
                     tgt_lang_id=src_lang_id,
                     length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
+                    goldfish_model=perplexity_model,
+                    goldfish_tokenizer=perplexity_tokenizer,
+                    goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
                 )
 
                 loss_scale = 1.0 / float(grad_accum_steps)
@@ -387,7 +410,7 @@ def train(config: DictConfig):
                             data,
                             eval_cfg,
                             tgt_lang_id=tgt_lang_id,
-                            device=device,
+                            device=policy_device,
                             max_new_tokens=max_new_tokens,
                         )
 
@@ -451,12 +474,12 @@ def train(config: DictConfig):
                         data,
                         eval_cfg,
                         tgt_lang_id=tgt_lang_id,
-                        device=device,
+                        device=policy_device,
                         max_new_tokens=max_new_tokens,
                     )
 
             # Refresh reference model at epoch boundaries
-            ref_model = copy.deepcopy(model).to(device)
+            ref_model = copy.deepcopy(model).to(aux_device)
             ref_model.eval()
             for p in ref_model.parameters():
                 p.requires_grad_(False)
@@ -468,7 +491,7 @@ def train(config: DictConfig):
             data,
             eval_cfg,
             tgt_lang_id=tgt_lang_id,
-            device=device,
+            device=policy_device,
             max_new_tokens=max_new_tokens,
         )
 

@@ -100,6 +100,10 @@ def grpo_compute_loss_and_logs(
     clip_param: float,
     tgt_lang_id: int,
     length_penalty_weight: float = 0.0,
+    goldfish_model=None,
+    goldfish_tokenizer=None,
+    goldfish_reward_weight: float = 0.5,
+
 ):
     if isinstance(ground_truths, str):
         ground_truths = [ground_truths]
