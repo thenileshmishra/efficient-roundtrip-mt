@@ -26,16 +26,51 @@ class TranslationDataModule(LightningDataModule):
         self.tokenizer = tokenizer
         self.train_data = None
         self.val_data = None
+        self.test_data = None
         self._train_sampler = None
         self._train_batch_size = max(int(train_batch_size), 1)
 
-    def setup(self, stage):
+    def setup(self, stage=None):
         prompts = load_dataset(
             self.hparams.data_path, self.hparams.dataset_config_name, trust_remote_code=True
         )
-        
-        self.train_data = TranslationDataPipe(prompts["train"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
-        self.val_data = TranslationDataPipe(prompts["valid"], self.tokenizer, src_col="sentence_" + self.hparams.source_lang, tgt_col="sentence_" + self.hparams.target_lang)
+
+        def _resolve_split(split_names):
+            for split_name in split_names:
+                if split_name in prompts:
+                    return prompts[split_name]
+            return None
+
+        train_split = _resolve_split(("train", "training"))
+        if train_split is None:
+            raise ValueError("Training split not found in dataset.")
+        self.train_data = TranslationDataPipe(
+            train_split,
+            self.tokenizer,
+            src_col="sentence_" + self.hparams.source_lang,
+            tgt_col="sentence_" + self.hparams.target_lang,
+        )
+
+        val_split = _resolve_split(("valid", "validation", "val"))
+        if val_split is None:
+            raise ValueError("Validation split not found in dataset.")
+        self.val_data = TranslationDataPipe(
+            val_split,
+            self.tokenizer,
+            src_col="sentence_" + self.hparams.source_lang,
+            tgt_col="sentence_" + self.hparams.target_lang,
+        )
+
+        test_split = _resolve_split(("test", "test_final"))
+        if test_split is not None:
+            self.test_data = TranslationDataPipe(
+                test_split,
+                self.tokenizer,
+                src_col="sentence_" + self.hparams.source_lang,
+                tgt_col="sentence_" + self.hparams.target_lang,
+            )
+        else:
+            self.test_data = None
 
     def train_dataloader(self):
         if self._train_sampler is not None:
@@ -57,6 +92,16 @@ class TranslationDataModule(LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
+            batch_size=48,
+            num_workers=0,
+            collate_fn=self._collate_batch,
+        )
+
+    def test_dataloader(self):
+        if self.test_data is None:
+            return None
+        return DataLoader(
+            self.test_data,
             batch_size=48,
             num_workers=0,
             collate_fn=self._collate_batch,

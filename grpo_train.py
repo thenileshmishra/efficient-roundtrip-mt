@@ -24,14 +24,15 @@ from dl import TranslationDataModule
 def _run_evaluation(
     model: torch.nn.Module,
     tokenizer,
-    data_module,
+    dataloader,
     eval_cfg,
     *,
     tgt_lang_id: int,
     device: torch.device,
     max_new_tokens: int,
+    split_name: str = "eval",
 ):
-    if eval_cfg is None:
+    if eval_cfg is None or dataloader is None:
         return {}
 
     requested_metrics = getattr(eval_cfg, "translation_metric", [])
@@ -42,14 +43,15 @@ def _run_evaluation(
     was_training = model.training
     model.eval()
 
-    val_loader = data_module.val_dataloader()
+    metric_prefix = split_name.strip().replace(" ", "_") or "eval"
+    loader = dataloader
     predictions = []
     references = []
     sample_records = []
 
     # Progress bar setup
     try:
-        total_batches = len(val_loader)
+        total_batches = len(loader)
     except TypeError:
         # Fallback if len(val_loader) is not available
         total_batches = None
@@ -67,8 +69,8 @@ def _run_evaluation(
         generation_kwargs["early_stopping"] = True
 
     with torch.no_grad():
-        with tqdm(total=total_batches, desc="Evaluating", leave=False) as pbar:
-            for idx, batch in enumerate(val_loader):
+        with tqdm(total=total_batches, desc=f"Evaluating ({metric_prefix})", leave=False) as pbar:
+            for idx, batch in enumerate(loader):
                 if len(batch) == 4:
                     encoder_inputs, ground_truths, _, sample_ids = batch
                 else:
@@ -102,15 +104,15 @@ def _run_evaluation(
             predictions=predictions,
             references=[[r] for r in references],
         )
-        results["eval/bleu"] = float(bleu_res.get("score", 0.0))
+        results[f"{metric_prefix}/bleu"] = float(bleu_res.get("score", 0.0))
     if predictions and "chrf++" in requested_metrics:
         chrf_metric = CHRF(word_order=2, char_order=6)
         # sacrebleu expects references as list of reference sets
         score = chrf_metric.corpus_score(hypotheses=predictions, references=[references]).score
-        results["eval/chrf++"] = float(score)
+        results[f"{metric_prefix}/chrf++"] = float(score)
 
     if results:
-        print("Evaluation results:")
+        print(f"{split_name.capitalize()} evaluation results:")
         for key, value in results.items():
             print(f"  {key}: {value:.4f}")
 
@@ -195,6 +197,15 @@ def train(config: DictConfig):
     if run_eval and eval_cfg is not None:
         eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
 
+    test_cfg = getattr(config.task, "test", None)
+    run_test = bool(getattr(test_cfg, "run", False)) if test_cfg is not None else False
+    test_eval_cfg = None
+    if run_test:
+        if eval_cfg is not None:
+            test_eval_cfg = OmegaConf.merge(eval_cfg, test_cfg)
+        else:
+            test_eval_cfg = test_cfg
+
     # Initialize Weights & Biases
     model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
     run_name = f"grpo_{model_name_for_run}_outcome_reward_batch_{config.task.training.batch_size}_src_tgt_grad_accum_length_penalty"
@@ -239,6 +250,15 @@ def train(config: DictConfig):
     )
     data.setup("fit")
 
+    val_dataloader = data.val_dataloader() if run_eval else None
+    test_dataloader = None
+    if run_test:
+        test_dataloader = data.test_dataloader()
+        if test_dataloader is None:
+            print("Test split not available; skipping test evaluation.")
+            run_test = False
+            test_eval_cfg = None
+
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
     updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
@@ -271,6 +291,17 @@ def train(config: DictConfig):
         accum_steps_since_update = 0
         optimizer_step = 0
         log_every_n_steps = max(int(getattr(config.task.training, "log_every_n_steps", 10)), 1)
+    if run_eval:
+        _run_evaluation(
+            model,
+            tokenizer,
+            val_dataloader,
+            eval_cfg,
+            tgt_lang_id=tgt_lang_id,
+            device=policy_device,
+            max_new_tokens=max_new_tokens,
+            split_name="eval",
+        )
 
     if run_training:
         for epoch in range(max_epochs):
@@ -294,6 +325,7 @@ def train(config: DictConfig):
                     top_k=int(getattr(config.task.training, "top_k", 100)),
                     top_p=float(getattr(config.task.training, "top_p", 0.95)),
                     end_of_sentence_token_id=tokenizer.eos_token_id,
+                    
                 )
 
                 seq_len = generated_local.size(1)
@@ -402,16 +434,17 @@ def train(config: DictConfig):
                     optimizer_step += 1
                     performed_optimizer_step = True
 
-                if performed_optimizer_step or (optimizer_step == 0):
+                if performed_optimizer_step:
                     if run_eval and eval_every_n_batches > 0 and (optimizer_step % eval_every_n_batches == 0):
                         _run_evaluation(
                             model,
                             tokenizer,
-                            data,
+                            val_dataloader,
                             eval_cfg,
                             tgt_lang_id=tgt_lang_id,
                             device=policy_device,
                             max_new_tokens=max_new_tokens,
+                            split_name="eval",
                         )
 
                 if performed_optimizer_step and (optimizer_step % log_every_n_steps == 0):
@@ -427,8 +460,8 @@ def train(config: DictConfig):
                         decoded = tokenizer.decode(
                             generated_all[idx, 0], skip_special_tokens=True
                         )
-                        best_candidates.append((reference, decoded, sample_ids[idx]))
-                    ref_text, gen_text, src_text,ref_sample_id = best_candidates[0]
+                        best_candidates.append((reference, decoded, source_texts[idx], sample_ids[idx]))
+                    ref_text, gen_text, src_text, ref_sample_id = best_candidates[0]
                     print(f"Source[{ref_sample_id}]: {src_text}")
                     print(f"Reference[{ref_sample_id}]: {ref_text}")
                     print(f"Generated[{ref_sample_id}]: {gen_text}")
@@ -471,11 +504,12 @@ def train(config: DictConfig):
                     _run_evaluation(
                         model,
                         tokenizer,
-                        data,
+                        val_dataloader,
                         eval_cfg,
                         tgt_lang_id=tgt_lang_id,
                         device=policy_device,
                         max_new_tokens=max_new_tokens,
+                        split_name="eval",
                     )
 
             # Refresh reference model at epoch boundaries
@@ -484,15 +518,28 @@ def train(config: DictConfig):
             for p in ref_model.parameters():
                 p.requires_grad_(False)
 
-    if run_eval:
+    if run_eval and not eval_only:
         _run_evaluation(
             model,
             tokenizer,
-            data,
+            val_dataloader,
             eval_cfg,
             tgt_lang_id=tgt_lang_id,
             device=policy_device,
             max_new_tokens=max_new_tokens,
+            split_name="eval",
+        )
+        
+    if run_test:
+        _run_evaluation(
+            model,
+            tokenizer,
+            test_dataloader,
+            test_eval_cfg,
+            tgt_lang_id=tgt_lang_id,
+            device=policy_device,
+            max_new_tokens=max_new_tokens,
+            split_name="test",
         )
 
     # Save final model when training occurred

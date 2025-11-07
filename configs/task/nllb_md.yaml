@@ -8,7 +8,8 @@ data:
 
 model:
   # name: "facebook/nllb-200-distilled-1.3B"
-  name: "facebook/nllb-200-distilled-600M"
+  # name: "facebook/nllb-200-distilled-600M"
+  name: "model/"
   # name: "facebook/nllb-200-3.3B"
   use_lora: false
   lora:
@@ -20,11 +21,11 @@ model:
       - v_proj
 
 training:
-  lr: 0.000002
+  lr: 0.000003
   accumulate_grad_batches: 16
   epochs: 10
-  batch_size: 2
-  num_return_sequences: 4
+  batch_size: 8
+  num_return_sequences: 2
   updates_per_batch: 1000
   gen_temperature: 1.8
   beta: 0.04
@@ -32,19 +33,24 @@ training:
   top_k: 100
   top_p: 0.95
   use_wandb: true
+  log_every_n_steps: 5
 
 eval:
-  run: true
-  only: false
+  run: false
+  only: true
   translation_metric: ["chrf++"]
-  every_n_batches: 10
+  every_n_batches: 8
+
+test:
+  run: true
+  translation_metric: ["chrf++"]
 
 reward:
   # MT reward settings (BLEU and chrF++)
   bleu_weight: 0.0  # Weight for BLEU score
   chrf_weight: 0.5  # Weight for chrF++ score
-  length_penalty_weight: 0.2
-
-constraints:
+  length_penalty_weight: 0.1
+  goldfish_reward_weight: 0.4
+constraints: 
   min_sentence_len: 1
   max_sentence_len: 63 # excluding first eos and langid tokens

@@ -59,6 +59,8 @@ def grpo_compute_decoder_per_token_logps(
     decoder_input_ids: torch.Tensor,
     target_ids: torch.Tensor,
 ) -> torch.Tensor:
+    device = next(model.parameters()).device
+
     # Repeat encoder inputs to match number of sequences
     base_batch_size = encoder_inputs["input_ids"].size(0)
     batch_multiplier = decoder_input_ids.size(0) // base_batch_size
@@ -68,11 +70,17 @@ def grpo_compute_decoder_per_token_logps(
             f"Got encoder batch {base_batch_size} and decoder batch {decoder_input_ids.size(0)}."
         )
     repeated_input_ids = encoder_inputs["input_ids"].repeat_interleave(batch_multiplier, dim=0)
+    repeated_input_ids = repeated_input_ids.to(device)
     attention_mask = encoder_inputs.get("attention_mask", None)
     if attention_mask is not None:
         attention_mask = attention_mask.repeat_interleave(batch_multiplier, dim=0)
+        attention_mask = attention_mask.to(device)
+
+    decoder_input_ids = decoder_input_ids.to(device)
+    target_ids = target_ids.to(device)
 
     decoder_attention_mask = (decoder_input_ids != tokenizer.pad_token_id).long()
+    decoder_attention_mask = decoder_attention_mask.to(device)
 
     outputs = model(
         input_ids=repeated_input_ids,
@@ -86,6 +94,45 @@ def grpo_compute_decoder_per_token_logps(
     per_token_logps = _gather_log_probs_from_logits_logits(logits, target_ids)  # (B, L)
     return per_token_logps
 
+# Return the log-probability of the target text given the input text.
+def score_text(model, tokenizer, input_text, target_text):
+    loss = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, reduction='none')
+    # Prepare inputs.
+    input_tokens = tokenizer([input_text], add_special_tokens=False)['input_ids'][0]
+    target_tokens = tokenizer([target_text], add_special_tokens=False)['input_ids'][0]
+    sequence_tokens = input_tokens + target_tokens
+    # Prepend [CLS] to input sequence, to match training format.
+    sequence_tokens.insert(0, tokenizer.cls_token_id)  # Start token.
+    max_seq_len = getattr(tokenizer, "model_max_length", None)
+    if isinstance(max_seq_len, int) and max_seq_len > 0:
+        assert len(sequence_tokens) <= max_seq_len
+    sequence_tokens = torch.tensor([sequence_tokens])
+    if torch.cuda.is_available():
+        sequence_tokens = sequence_tokens.cuda()
+    # Run model.
+    # input_ids shape: (n_examples=1, seq_length). Sequence tokens includes
+    # start of sequence token.
+    outputs = model(input_ids=sequence_tokens,
+                    output_hidden_states=False, return_dict=True)
+    # Logits shape: (n_examples=1, seq_len, vocab_size).
+    logits = outputs['logits'].detach()
+    del outputs
+    # Labels are the ground truth next token for each index.
+    labels = sequence_tokens[:, 1:]  # Shape: (n_examples=1, seq_len-1).
+    # Next token probabilities ignored for last token.
+    logits = logits[:, :-1, :]
+    # To apply loss, logits should be shape: (n_examples=1, vocab_size, seq_len-1).
+    logits = torch.transpose(logits, 1, 2)
+    # Loss shape: (n_examples=1, seq_len-1).
+    # These are negative log probabilities (natural log), corresponding to each
+    # token in sequence_tokens excluding the start token.
+    losses = loss(logits, labels).cpu()
+    # Only consider for the targets, not inputs.
+    losses = losses[0, len(input_tokens):]
+    logprobs = -1.0 * losses
+    # Log-probability of entire target text is the sum of token log-probs.
+    summed_logprobs = torch.sum(logprobs, dim=-1).item()
+    return summed_logprobs
 
 def grpo_compute_loss_and_logs(
     model,
@@ -117,6 +164,8 @@ def grpo_compute_loss_and_logs(
         )
 
     device = next(model.parameters()).device
+    generated_sequences = generated_sequences.to(device)
+
     batch_size, num_candidates, seq_len = generated_sequences.size()
     if batch_size != len(ground_truths):
         raise ValueError(
@@ -135,7 +184,7 @@ def grpo_compute_loss_and_logs(
     with torch.no_grad():
         ref_per_token_logps = grpo_compute_decoder_per_token_logps(
             ref_model, tokenizer, encoder_inputs, decoder_input_ids, target_ids
-        )
+        ).to(device)
 
     # Completion mask to ignore pads and tokens after first EOS
     is_pad = target_ids == tokenizer.pad_token_id
@@ -152,7 +201,7 @@ def grpo_compute_loss_and_logs(
             generated_sequences.reshape(-1, generated_sequences.size(-1)) == tokenizer.pad_token_id,
             end_of_sentence_token_id,
             generated_sequences.reshape(-1, generated_sequences.size(-1)),
-        ),
+        ).cpu(),
         skip_special_tokens=True,
     )
     references = [
@@ -169,16 +218,28 @@ def grpo_compute_loss_and_logs(
         score = (
             chrf_metric.corpus_score(hypotheses=[hyp], references=[[ref]]).score / 100.0
         )
+        
+        # if the target language is not English, score the log-probability of the target text given the input text.
+        if tgt_lang_id != 256047:
+            input_text = " ".join(hyp.split(" ")[:-1])
+            target_text = hyp.split(" ")[-1]
+            log_prob = score_text(goldfish_model, goldfish_tokenizer, input_text, target_text)
+            # divide by 100 as hypothetical maximum
+            log_prob = log_prob / 100.0
+            log_prob = log_prob * goldfish_reward_weight
+        else:
+            log_prob = 0.0
+            
         if length_penalty_weight > 0:
             hyp_ids = tokenizer.encode(hyp, add_special_tokens=False)
             ref_ids = tokenizer.encode(ref, add_special_tokens=False)
             ref_len = max(len(ref_ids), 1)
             length_diff = abs(len(hyp_ids) - len(ref_ids)) / ref_len
-            penalty = length_penalty_weight * length_diff
+            penalty = -1 * length_penalty_weight * length_diff
         else:
             penalty = 0.0
         chrf_scores.append(score)
-        adjusted_scores.append(score - penalty)
+        adjusted_scores.append(score + penalty + log_prob)
         length_penalties.append(penalty)
     chrf_scores_tensor = torch.tensor(chrf_scores, device=device)
     chrf_mean = chrf_scores_tensor.mean()
