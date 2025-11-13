@@ -3,13 +3,13 @@ name: "nllb-multi-domain"
 data:
   path: "breakend/nllb-multi-domain"
   source_lang: eng_Latn
-  target_lang: ayr_Latn
-  dataset_config_name: "eng_Latn-ayr_Latn"
+  target_lang: rus_Cyrl
+  dataset_config_name: "eng_Latn-rus_Cyrl"
 
 model:
   # name: "facebook/nllb-200-distilled-1.3B"
-  # name: "facebook/nllb-200-distilled-600M"
-  name: "model/"
+  name: "facebook/nllb-200-distilled-600M"
+  # name: "model/"
   # name: "facebook/nllb-200-3.3B"
   use_lora: false
   lora:
@@ -24,9 +24,9 @@ training:
   lr: 0.000003
   accumulate_grad_batches: 16
   epochs: 10
-  batch_size: 8
-  num_return_sequences: 2
-  updates_per_batch: 1000
+  batch_size: 3
+  num_return_sequences: 4
+  updates_per_batch: 1
   gen_temperature: 1.8
   beta: 0.04
   clip_param: 0.2
@@ -34,12 +34,13 @@ training:
   top_p: 0.95
   use_wandb: true
   log_every_n_steps: 5
-
+  update_ref_policy_every_n_steps: 16
+  
 eval:
-  run: false
-  only: true
+  run: true
+  only: false
   translation_metric: ["chrf++"]
-  every_n_batches: 8
+  every_n_opt_steps: 5
 
 test:
   run: true

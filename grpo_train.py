@@ -146,14 +146,14 @@ def train(config: DictConfig):
     model, tokenizer = get_model(config)
     model.to(policy_device)
     # Perplexity model for rewarding the generated sequences
-    perplexity_config = AutoConfig.from_pretrained(f"goldfish-models/{config.task.data.target_lang}_full")
-    perplexity_model = AutoModelForCausalLM.from_pretrained(
-        f"goldfish-models/{config.task.data.target_lang}_full", config=perplexity_config
-    )
-    perplexity_tokenizer = AutoTokenizer.from_pretrained(
-        f"goldfish-models/{config.task.data.target_lang}_full"
-    )
-    perplexity_model.to(aux_device)
+    # perplexity_config = AutoConfig.from_pretrained(f"goldfish-models/{config.task.data.target_lang}_full")
+    # perplexity_model = AutoModelForCausalLM.from_pretrained(
+    #     f"goldfish-models/{config.task.data.target_lang}_full", config=perplexity_config
+    # )
+    # perplexity_tokenizer = AutoTokenizer.from_pretrained(
+    #     f"goldfish-models/{config.task.data.target_lang}_full"
+    # )
+    # perplexity_model.to(aux_device)
     source_lang_code = config.task.data.source_lang
     target_lang_code = config.task.data.target_lang
     if hasattr(tokenizer, "src_lang"):
@@ -177,26 +177,16 @@ def train(config: DictConfig):
             tokenizer.src_lang = previous_src_lang
         return encoded
 
-    def _compute_grad_norm():
-        grads = [
-            p.grad.detach().float().norm(2)
-            for p in model.parameters()
-            if p.requires_grad and p.grad is not None
-        ]
-        if not grads:
-            return 0.0
-        return torch.norm(torch.stack(grads), 2).item()
-
     eval_cfg = getattr(config.task, "eval", None)
     eval_only = bool(getattr(eval_cfg, "only", False)) if eval_cfg is not None else False
     run_eval = bool(getattr(eval_cfg, "run", False)) if eval_cfg is not None else False
     if eval_only:
         run_eval = True
     run_training = not eval_only
-    eval_every_n_batches = 0
+    eval_every_n_opt_steps = 0
     if run_eval and eval_cfg is not None:
-        eval_every_n_batches = int(getattr(eval_cfg, "every_n_batches", 0))
-
+        eval_every_n_opt_steps = int(getattr(eval_cfg, "every_n_opt_steps", 0))
+    
     test_cfg = getattr(config.task, "test", None)
     run_test = bool(getattr(test_cfg, "run", False)) if test_cfg is not None else False
     test_eval_cfg = None
@@ -208,7 +198,7 @@ def train(config: DictConfig):
 
     # Initialize Weights & Biases
     model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
-    run_name = f"grpo_{model_name_for_run}_outcome_reward_batch_{config.task.training.batch_size}_src_tgt_grad_accum_length_penalty"
+    run_name = f"grpo_{model_name_for_run}_outcome_reward_batch_{config.task.training.batch_size}_src_tgt_src_grad_accum_self-supervised_rus"
     run_wandb = bool(getattr(config.task.training, "use_wandb", True))
     if run_wandb:
         wandb.init(
@@ -311,196 +301,114 @@ def train(config: DictConfig):
             for batch in train_loader:
                 src_prompt, ground_truths, source_texts, sample_ids = batch
                 encoder_inputs = {k: v.to(policy_device, non_blocking=True) for k, v in src_prompt.items()}
-                batch_size = encoder_inputs["input_ids"].size(0)
-            
-                # Generate candidate sequences with current policy
-                generated_local = grpo_generate_sequences(
-                    model,
-                    tokenizer,
-                    encoder_inputs,
-                    tgt_lang_id,
-                    max_new_tokens=max_new_tokens,
-                    gen_temperature=gen_temperature,
-                    num_return_sequences=num_return_sequences,
-                    top_k=int(getattr(config.task.training, "top_k", 100)),
-                    top_p=float(getattr(config.task.training, "top_p", 0.95)),
-                    end_of_sentence_token_id=tokenizer.eos_token_id,
+                batch_size = encoder_inputs["input_ids"].size(0)                
+                while optimizer_step < updates_per_batch:
+                    # Generate candidate sequences with current policy
+                    generated_local = grpo_generate_sequences(
+                        model,
+                        tokenizer,
+                        encoder_inputs,
+                        tgt_lang_id,
+                        max_new_tokens=max_new_tokens,
+                        gen_temperature=gen_temperature,
+                        num_return_sequences=num_return_sequences,
+                        top_k=int(getattr(config.task.training, "top_k", 100)),
+                        top_p=float(getattr(config.task.training, "top_p", 0.95)),
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                        
+                    )
                     
-                )
-
-                seq_len = generated_local.size(1)
-                try:
-                    generated_all = generated_local.reshape(batch_size, num_return_sequences, seq_len)
-                except RuntimeError as exc:
-                    raise RuntimeError(
-                        "Unable to reshape generated sequences into (batch_size, num_return_sequences, seq_len). "
-                        f"Batch size={batch_size}, num_return_sequences={num_return_sequences}, seq_len={seq_len}."
-                    ) from exc
-
-                # Compute GRPO loss and update model
-                loss_forward, logs_forward = grpo_compute_loss_and_logs(
-                    model,
-                    ref_model,
-                    tokenizer,
-                    encoder_inputs,
-                    generated_all,
-                    ground_truths,
-                    end_of_sentence_token_id=tokenizer.eos_token_id,
-                    beta=beta,
-                    clip_param=clip_param,
-                    tgt_lang_id=tgt_lang_id,
-                    length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
-                    goldfish_model=perplexity_model,
-                    goldfish_tokenizer=perplexity_tokenizer,
-                    goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
-                )
-                
-                loss_scale = 1.0 / float(grad_accum_steps)
-                loss_forward = loss_forward * loss_scale
-                loss_forward.backward()
-                # Prepare backward direction prompts from generated target sentences
-                forward_generated_flat = generated_all.reshape(
-                    batch_size * num_return_sequences, seq_len
-                )
-                forward_prompt_texts = tokenizer.batch_decode(
-                    forward_generated_flat, skip_special_tokens=True
-                )
-                backward_inputs_encoded = _tokenize_with_lang(
-                    forward_prompt_texts, target_lang_code
-                )
-                backward_inputs = {
-                    k: v.to(policy_device, non_blocking=True)
-                    for k, v in backward_inputs_encoded.items()
-                }
-                backward_batch_size = backward_inputs["input_ids"].size(0)
-                generated_backward = grpo_generate_sequences(
-                    model,
-                    tokenizer,
-                    backward_inputs,
-                    src_lang_id,
-                    max_new_tokens=max_new_tokens,
-                    gen_temperature=gen_temperature,
-                    num_return_sequences=num_return_sequences,
-                    top_k=int(getattr(config.task.training, "top_k", 100)),
-                    top_p=float(getattr(config.task.training, "top_p", 0.95)),
-                    end_of_sentence_token_id=tokenizer.eos_token_id,
-                )
-
-                back_seq_len = generated_backward.size(1)
-                try:
-                    generated_backward_all = generated_backward.reshape(
-                        backward_batch_size, num_return_sequences, back_seq_len
+                    seq_len = generated_local.size(1)
+                    try:
+                        generated_all = generated_local.reshape(batch_size, num_return_sequences, seq_len)
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "Unable to reshape generated sequences into (batch_size, num_return_sequences, seq_len). "
+                            f"Batch size={batch_size}, num_return_sequences={num_return_sequences}, seq_len={seq_len}."
+                        ) from exc
+                    
+                    # Prepare backward direction prompts from generated target sentences
+                    forward_generated_flat = generated_all.reshape(
+                        batch_size * num_return_sequences, seq_len
                     )
-                except RuntimeError as exc:
-                    raise RuntimeError(
-                        "Unable to reshape backward generated sequences into "
-                        "(batch_size, num_return_sequences, seq_len). "
-                        f"Batch size={backward_batch_size}, num_return_sequences={num_return_sequences}, "
-                        f"seq_len={back_seq_len}."
-                    ) from exc
-
-                expanded_source_texts = [
-                    source_texts[idx // num_return_sequences]
-                    for idx in range(backward_batch_size)
-                ]
-
-                loss_backward, logs_backward = grpo_compute_loss_and_logs(
-                    model,
-                    ref_model,
-                    tokenizer,
-                    backward_inputs,
-                    generated_backward_all,
-                    expanded_source_texts,
-                    end_of_sentence_token_id=tokenizer.eos_token_id,
-                    beta=beta,
-                    clip_param=clip_param,
-                    tgt_lang_id=src_lang_id,
-                    length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
-                    goldfish_model=perplexity_model,
-                    goldfish_tokenizer=perplexity_tokenizer,
-                    goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
-                )
-
-                loss_scale = 1.0 / float(grad_accum_steps)
-                (loss_backward * loss_scale).backward()
-                accum_steps_since_update += 1
-                performed_optimizer_step = False
-                grad_norm = None
-                if accum_steps_since_update >= grad_accum_steps:
-                    grad_norm = _compute_grad_norm()
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    accum_steps_since_update = 0
-                    optimizer_step += 1
-                    performed_optimizer_step = True
-
-                if performed_optimizer_step:
-                    if run_eval and eval_every_n_batches > 0 and (optimizer_step % eval_every_n_batches == 0):
-                        _run_evaluation(
-                            model,
-                            tokenizer,
-                            val_dataloader,
-                            eval_cfg,
-                            tgt_lang_id=tgt_lang_id,
-                            device=policy_device,
-                            max_new_tokens=max_new_tokens,
-                            split_name="eval",
-                        )
-
-                if performed_optimizer_step and (optimizer_step % log_every_n_steps == 0):
-                    print(
-                        f"[epoch {epoch}] step {step_idx} (opt {optimizer_step}) | "
-                        f"f_loss={logs_forward['loss'].item():.4f} "
-                        f"f_kl={logs_forward['kl'].item():.4f} f_reward={logs_forward['reward'].item():.4f} "
-                        f"f_chrf={logs_forward['chrf'].item():.4f} | length_penalty={logs_forward['length_penalty'].item():.4f} | grad_norm={grad_norm:.4f} b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} b_length_penalty={logs_backward['length_penalty'].item():.4f} b_grad_norm={grad_norm:.4f}"
+                    forward_prompt_texts = tokenizer.batch_decode(
+                        forward_generated_flat, skip_special_tokens=True
                     )
-                    # Print the reference and one generated sequence for inspection
-                    best_candidates = []
-                    for idx, reference in enumerate(ground_truths):
-                        decoded = tokenizer.decode(
-                            generated_all[idx, 0], skip_special_tokens=True
+                    backward_inputs_encoded = _tokenize_with_lang(
+                        forward_prompt_texts, target_lang_code
+                    )
+                    backward_inputs = {
+                        k: v.to(policy_device, non_blocking=True)
+                        for k, v in backward_inputs_encoded.items()
+                    }
+                    backward_batch_size = backward_inputs["input_ids"].size(0)
+                    generated_backward = grpo_generate_sequences(
+                        model,
+                        tokenizer,
+                        backward_inputs,
+                        src_lang_id,
+                        max_new_tokens=max_new_tokens,
+                        gen_temperature=gen_temperature,
+                        num_return_sequences=num_return_sequences,
+                        top_k=int(getattr(config.task.training, "top_k", 100)),
+                        top_p=float(getattr(config.task.training, "top_p", 0.95)),
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                    )
+
+                    back_seq_len = generated_backward.size(1)
+                    try:
+                        generated_backward_all = generated_backward.reshape(
+                            backward_batch_size, num_return_sequences, back_seq_len
                         )
-                        best_candidates.append((reference, decoded, source_texts[idx], sample_ids[idx]))
-                    ref_text, gen_text, src_text, ref_sample_id = best_candidates[0]
-                    print(f"Source[{ref_sample_id}]: {src_text}")
-                    print(f"Reference[{ref_sample_id}]: {ref_text}")
-                    print(f"Generated[{ref_sample_id}]: {gen_text}")
-                    back_best = tokenizer.decode(
-                            generated_backward_all[0, 0], skip_special_tokens=True
-                        )
-                    print(f"Back-Generated[{ref_sample_id}]: {back_best}")
-                    if run_wandb:
-                        # Log to Weights & Biases
-                        wandb.log(
-                            {
-                                "train/forward_loss": float(logs_forward["loss"].item()),
-                                "train/forward_kl": float(logs_forward["kl"].item()),
-                                "train/forward_chrf": float(logs_forward["chrf"].item()),
-                                "train/forward_reward": float(logs_forward["reward"].item()),
-                                "train/forward_grad_norm": float(grad_norm),
-                                "train/backward_loss": float(logs_backward["loss"].item()),
-                                "train/backward_kl": float(logs_backward["kl"].item()),
-                                "train/backward_chrf": float(logs_backward["chrf"].item()),
-                                "train/backward_reward": float(logs_backward["reward"].item()),
-                                "train/backward_grad_norm": float(grad_norm),
-                            }
-                        )
-                    # if train_table is not None:
-                    #     for reference, decoded, ref_sample_id in best_candidates:
-                    #         train_table.add_data(
-                    #             reference,
-                    #             decoded,
-                    #             ref_sample_id,
-                    #         )
-                    #     wandb.log({"train/Translations": train_table}, step=step_idx)
-                step_idx += 1
-            if accum_steps_since_update > 0:
-                grad_norm = _compute_grad_norm()
-                optimizer.step()
-                optimizer.zero_grad()
-                accum_steps_since_update = 0
-                optimizer_step += 1
-                if run_eval and eval_every_n_batches > 0 and (optimizer_step % eval_every_n_batches == 0):
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "Unable to reshape backward generated sequences into "
+                            "(batch_size, num_return_sequences, seq_len). "
+                            f"Batch size={backward_batch_size}, num_return_sequences={num_return_sequences}, "
+                            f"seq_len={back_seq_len}."
+                        ) from exc
+
+                    expanded_source_texts = [
+                        source_texts[idx // num_return_sequences]
+                        for idx in range(backward_batch_size)
+                    ]
+
+                    loss_backward, logs_backward = grpo_compute_loss_and_logs(
+                        model,
+                        ref_model,
+                        tokenizer,
+                        backward_inputs,
+                        generated_backward_all,
+                        expanded_source_texts,
+                        end_of_sentence_token_id=tokenizer.eos_token_id,
+                        beta=beta,
+                        clip_param=clip_param,
+                        tgt_lang_id=src_lang_id,
+                        length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
+                        # goldfish_model=perplexity_model,
+                        # goldfish_tokenizer=perplexity_tokenizer,
+                        # goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
+                    )
+
+                    loss_scale = 1.0 / float(grad_accum_steps)
+                    (loss_backward * loss_scale).backward()
+                    performed_optimizer_step = False
+                    accum_steps_since_update += 1
+                    if accum_steps_since_update >= grad_accum_steps:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        accum_steps_since_update = 0
+                        optimizer_step += 1
+                        performed_optimizer_step = True
+                        if optimizer_step % int(getattr(config.task.training, "update_ref_policy_every_n_steps", 16)) == 0:
+                            # Refresh reference model at epoch boundaries
+                            ref_model = copy.deepcopy(model).to(aux_device)
+                            ref_model.eval()
+                            for p in ref_model.parameters():
+                                p.requires_grad_(False)
+
+                updates_per_batch += getattr(config.task.training, "updates_per_batch", 50)
+                if run_eval and eval_every_n_opt_steps > 0 and (optimizer_step % eval_every_n_opt_steps == 0):
                     _run_evaluation(
                         model,
                         tokenizer,
@@ -512,11 +420,61 @@ def train(config: DictConfig):
                         split_name="eval",
                     )
 
-            # Refresh reference model at epoch boundaries
-            ref_model = copy.deepcopy(model).to(aux_device)
-            ref_model.eval()
-            for p in ref_model.parameters():
-                p.requires_grad_(False)
+                print(
+                    f"[epoch {epoch}] step {step_idx} (opt {optimizer_step}) | "
+                    f"b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} b_bleu={logs_backward['bleu'].item():.4f}"
+                )
+                # Print the reference and one generated sequence for inspection
+                best_candidates = []
+                for idx, reference in enumerate(ground_truths):
+                    decoded = tokenizer.decode(
+                        generated_all[idx, 0], skip_special_tokens=True
+                    )
+                    best_candidates.append((reference, decoded, source_texts[idx], sample_ids[idx]))
+                ref_text, gen_text, src_text, ref_sample_id = best_candidates[0]
+                print(f"Source[{ref_sample_id}]: {src_text}")
+                print(f"Reference[{ref_sample_id}]: {ref_text}")
+                print(f"Generated[{ref_sample_id}]: {gen_text}")
+                back_best = tokenizer.decode(
+                        generated_backward_all[0, 0], skip_special_tokens=True
+                    )
+                print(f"Back-Generated[{ref_sample_id}]: {back_best}")
+                if run_wandb:
+                    # Log to Weights & Biases
+                    wandb.log(
+                        {
+                            "train/backward_loss": float(logs_backward["loss"].item()),
+                            "train/backward_kl": float(logs_backward["kl"].item()),
+                            "train/backward_chrf": float(logs_backward["chrf"].item()),
+                            "train/backward_reward": float(logs_backward["reward"].item()),
+                            "train/backward_bleu": float(logs_backward["bleu"].item()),
+                        }
+                    )
+                    # if train_table is not None:
+                    #     for reference, decoded, ref_sample_id in best_candidates:
+                    #         train_table.add_data(
+                    #             reference,
+                    #             decoded,
+                    #             ref_sample_id,
+                    #         )
+                    #     wandb.log({"train/Translations": train_table}, step=step_idx)
+                step_idx += 1
+            if accum_steps_since_update > 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_steps_since_update = 0
+                optimizer_step += 1
+                if run_eval and eval_every_n_opt_steps > 0 and (optimizer_step % eval_every_n_opt_steps == 0):
+                    _run_evaluation(
+                        model,
+                        tokenizer,
+                        val_dataloader,
+                        eval_cfg,
+                        tgt_lang_id=tgt_lang_id,
+                        device=policy_device,
+                        max_new_tokens=max_new_tokens,
+                        split_name="eval",
+                    )
 
     if run_eval and not eval_only:
         _run_evaluation(

@@ -13,7 +13,7 @@
             "console": "integratedTerminal",
             "env": {
                 "TOKENIZERS_PARALLELISM": "true",
-                "CUDA_VISIBLE_DEVICES": "0"
+                // "CUDA_VISIBLE_DEVICES": "0"
             },
             "justMyCode": false
         },
