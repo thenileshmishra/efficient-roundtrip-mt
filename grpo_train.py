@@ -31,6 +31,10 @@ def _run_evaluation(
     device: torch.device,
     max_new_tokens: int,
     split_name: str = "eval",
+    step_idx: int = 0,
+    total_training_steps: int = 0,
+    wandb_run = None,
+    wandb_table = None,
 ):
     if eval_cfg is None or dataloader is None:
         return {}
@@ -71,10 +75,7 @@ def _run_evaluation(
     with torch.no_grad():
         with tqdm(total=total_batches, desc=f"Evaluating ({metric_prefix})", leave=False) as pbar:
             for idx, batch in enumerate(loader):
-                if len(batch) == 4:
-                    encoder_inputs, ground_truths, _, sample_ids = batch
-                else:
-                    encoder_inputs, ground_truths, sample_ids = batch
+                encoder_inputs, ground_truths, source_texts, sample_ids = batch
                 if isinstance(ground_truths, str):
                     ground_truths = [ground_truths]
                 else:
@@ -88,23 +89,17 @@ def _run_evaluation(
                 )
                 if generated.dim() == 1:
                     generated = generated.unsqueeze(0)
-                for sample_idx, reference in enumerate(ground_truths):
+                
+                for sample_idx, (reference, source_text) in enumerate(zip(ground_truths, source_texts)):
                     hypothesis = tokenizer.decode(generated[sample_idx], skip_special_tokens=True)
                     ref_text = reference if isinstance(reference, str) else str(reference)
                     predictions.append(hypothesis)
                     references.append(ref_text)
-                    sample_records.append((ref_text, hypothesis, sample_ids[sample_idx]))
+                    sample_records.append((ref_text, hypothesis, source_text, sample_ids[sample_idx], step_idx))
                 if pbar.total is not None:
                     pbar.update(1)
 
     results = {}
-    if predictions and "bleu" in requested_metrics:
-        bleu_metric = evaluate.load("sacrebleu")
-        bleu_res = bleu_metric.compute(
-            predictions=predictions,
-            references=[[r] for r in references],
-        )
-        results[f"{metric_prefix}/bleu"] = float(bleu_res.get("score", 0.0))
     if predictions and "chrf++" in requested_metrics:
         chrf_metric = CHRF(word_order=2, char_order=6)
         # sacrebleu expects references as list of reference sets
@@ -116,14 +111,16 @@ def _run_evaluation(
         for key, value in results.items():
             print(f"  {key}: {value:.4f}")
 
-    if wandb.run is not None and (results or sample_records):
-        log_payload = results.copy()
-        # if sample_records:
-        #     eval_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
-        #     for reference, hypothesis, sample_id in sample_records:
-        #         eval_table.add_data(reference, hypothesis, sample_id)
-        #     log_payload["eval/Translations"] = eval_table
-        wandb.log(log_payload)
+    if wandb_run is not None and (results or sample_records):
+        # log the sample records 5 times across training steps
+        if step_idx % (total_training_steps / 10) == 0 and split_name == "eval":
+            for reference, hypothesis, source_text, sample_id, step in sample_records:
+                wandb_table.add_data(reference, hypothesis, sample_id, step)
+        if split_name == "test":
+            for reference, hypothesis, source_text, sample_id, step in sample_records:
+                wandb_table.add_data(reference, hypothesis, sample_id, step)
+        wandb_run.log({f"{split_name}/Translations": wandb_table})
+        wandb_run.log(results)
 
     if was_training:
         model.train()
@@ -198,18 +195,13 @@ def train(config: DictConfig):
 
     # Initialize Weights & Biases
     model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
-    run_name = f"grpo_{model_name_for_run}_outcome_reward_batch_{config.task.training.batch_size}_src_tgt_src_grad_accum_self-supervised_rus"
+    run_name = f"{model_name_for_run}_outcome_batch_{config.task.training.batch_size}_src_tgt_src_{target_lang_code}"
     run_wandb = bool(getattr(config.task.training, "use_wandb", True))
+    wandb_table = None
+    wandb_run = None
     if run_wandb:
-        wandb.init(
-            project="grpo-translation-nllb-multi-domain",
-            name=run_name,
-            config=OmegaConf.to_container(config, resolve=True),
-            dir="/root/wandb",
-        )
-    train_table = None
-    if run_training and run_wandb:
-        train_table = wandb.Table(columns=["reference", "generated", "sample_id"], log_mode="MUTABLE")
+        wandb_run = wandb.init(project="grpo-translation-nllb-multi-domain", name=run_name)
+        wandb_table = wandb.Table(columns=["reference", "generated", "sample_id", "step"], log_mode="INCREMENTAL")
     # Reference model (frozen copy of the policy)
     reference_name = getattr(config.task.model, "reference_name", None)
     ref_model = None
@@ -248,7 +240,7 @@ def train(config: DictConfig):
             print("Test split not available; skipping test evaluation.")
             run_test = False
             test_eval_cfg = None
-
+    total_training_steps = int(getattr(config.task.training, "epochs", 1)) * len(data.train_dataloader())
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
     updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
@@ -280,7 +272,6 @@ def train(config: DictConfig):
         )
         accum_steps_since_update = 0
         optimizer_step = 0
-        log_every_n_steps = max(int(getattr(config.task.training, "log_every_n_steps", 10)), 1)
     if run_eval:
         _run_evaluation(
             model,
@@ -291,6 +282,10 @@ def train(config: DictConfig):
             device=policy_device,
             max_new_tokens=max_new_tokens,
             split_name="eval",
+            step_idx=0,
+            total_training_steps=total_training_steps,
+            wandb_run=wandb_run,
+            wandb_table=wandb_table,
         )
 
     if run_training:
@@ -392,14 +387,12 @@ def train(config: DictConfig):
 
                     loss_scale = 1.0 / float(grad_accum_steps)
                     (loss_backward * loss_scale).backward()
-                    performed_optimizer_step = False
                     accum_steps_since_update += 1
                     if accum_steps_since_update >= grad_accum_steps:
                         optimizer.step()
                         optimizer.zero_grad()
                         accum_steps_since_update = 0
                         optimizer_step += 1
-                        performed_optimizer_step = True
                         if optimizer_step % int(getattr(config.task.training, "update_ref_policy_every_n_steps", 16)) == 0:
                             # Refresh reference model at epoch boundaries
                             ref_model = copy.deepcopy(model).to(aux_device)
@@ -418,6 +411,10 @@ def train(config: DictConfig):
                         device=policy_device,
                         max_new_tokens=max_new_tokens,
                         split_name="eval",
+                        step_idx=step_idx,
+                        total_training_steps=total_training_steps,
+                        wandb_run=wandb_run,
+                        wandb_table=wandb_table,
                     )
 
                 print(
@@ -459,22 +456,6 @@ def train(config: DictConfig):
                     #         )
                     #     wandb.log({"train/Translations": train_table}, step=step_idx)
                 step_idx += 1
-            if accum_steps_since_update > 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                accum_steps_since_update = 0
-                optimizer_step += 1
-                if run_eval and eval_every_n_opt_steps > 0 and (optimizer_step % eval_every_n_opt_steps == 0):
-                    _run_evaluation(
-                        model,
-                        tokenizer,
-                        val_dataloader,
-                        eval_cfg,
-                        tgt_lang_id=tgt_lang_id,
-                        device=policy_device,
-                        max_new_tokens=max_new_tokens,
-                        split_name="eval",
-                    )
 
     if run_eval and not eval_only:
         _run_evaluation(
@@ -486,6 +467,10 @@ def train(config: DictConfig):
             device=policy_device,
             max_new_tokens=max_new_tokens,
             split_name="eval",
+            step_idx=step_idx,
+            total_training_steps=total_training_steps,
+            wandb_run=wandb_run,
+            wandb_table=wandb_table,
         )
         
     if run_test:
@@ -498,6 +483,10 @@ def train(config: DictConfig):
             device=policy_device,
             max_new_tokens=max_new_tokens,
             split_name="test",
+            step_idx=step_idx,
+            total_training_steps=total_training_steps,
+            wandb_run=wandb_run,
+            wandb_table=wandb_table,
         )
 
     # Save final model when training occurred
