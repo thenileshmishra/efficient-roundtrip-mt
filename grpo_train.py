@@ -4,14 +4,11 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 import wandb
-import evaluate
 from sacrebleu.metrics import CHRF
 from tqdm.auto import tqdm
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
-    AutoConfig,
-    AutoModelForCausalLM,
 )
 from lora_utils import apply_lora
 from utils import (
@@ -142,15 +139,6 @@ def train(config: DictConfig):
     # Build model and tokenizer
     model, tokenizer = get_model(config)
     model.to(policy_device)
-    # Perplexity model for rewarding the generated sequences
-    # perplexity_config = AutoConfig.from_pretrained(f"goldfish-models/{config.task.data.target_lang}_full")
-    # perplexity_model = AutoModelForCausalLM.from_pretrained(
-    #     f"goldfish-models/{config.task.data.target_lang}_full", config=perplexity_config
-    # )
-    # perplexity_tokenizer = AutoTokenizer.from_pretrained(
-    #     f"goldfish-models/{config.task.data.target_lang}_full"
-    # )
-    # perplexity_model.to(aux_device)
     source_lang_code = config.task.data.source_lang
     target_lang_code = config.task.data.target_lang
     if hasattr(tokenizer, "src_lang"):
@@ -329,6 +317,19 @@ def train(config: DictConfig):
                     forward_prompt_texts = tokenizer.batch_decode(
                         forward_generated_flat, skip_special_tokens=True
                     )
+                    
+                    # Calculate chrF for forward translations (source → target)
+                    chrf_metric = CHRF(word_order=2, char_order=6)
+                    forward_references = [
+                        ground_truths[idx // num_return_sequences]
+                        for idx in range(len(forward_prompt_texts))
+                    ]
+                    forward_chrf_scores = [
+                        chrf_metric.corpus_score(hypotheses=[hyp], references=[[ref]]).score
+                        for hyp, ref in zip(forward_prompt_texts, forward_references)
+                    ]
+                    forward_chrf_mean = sum(forward_chrf_scores) / len(forward_chrf_scores)
+                    
                     backward_inputs_encoded = _tokenize_with_lang(
                         forward_prompt_texts, target_lang_code
                     )
@@ -380,9 +381,6 @@ def train(config: DictConfig):
                         clip_param=clip_param,
                         tgt_lang_id=src_lang_id,
                         length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
-                        # goldfish_model=perplexity_model,
-                        # goldfish_tokenizer=perplexity_tokenizer,
-                        # goldfish_reward_weight=float(getattr(config.task.reward, "goldfish_reward_weight", 0.5)),
                     )
 
                     loss_scale = 1.0 / float(grad_accum_steps)
@@ -419,6 +417,7 @@ def train(config: DictConfig):
 
                 print(
                     f"[epoch {epoch}] step {step_idx} (opt {optimizer_step}) | "
+                    f"f_chrf={forward_chrf_mean:.4f} | "
                     f"b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} b_bleu={logs_backward['bleu'].item():.4f}"
                 )
                 # Print the reference and one generated sequence for inspection
@@ -440,6 +439,7 @@ def train(config: DictConfig):
                     # Log to Weights & Biases
                     wandb.log(
                         {
+                            "train/forward_chrf": float(forward_chrf_mean),
                             "train/backward_loss": float(logs_backward["loss"].item()),
                             "train/backward_kl": float(logs_backward["kl"].item()),
                             "train/backward_chrf": float(logs_backward["chrf"].item()),
@@ -456,7 +456,12 @@ def train(config: DictConfig):
                     #         )
                     #     wandb.log({"train/Translations": train_table}, step=step_idx)
                 step_idx += 1
-
+            # Save the model every epoch
+            epoch_save_dir = os.path.join(os.getcwd(), "model", f"{model_name_for_run}_epoch_{epoch}_{target_lang_code}")
+            os.makedirs(epoch_save_dir, exist_ok=True)
+            model.save_pretrained(epoch_save_dir)
+            tokenizer.save_pretrained(epoch_save_dir)
+            print(f"Model saved to {epoch_save_dir}")
     if run_eval and not eval_only:
         _run_evaluation(
             model,
