@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from typing import List, Optional, Dict, Tuple
+from datasets import load_dataset
 from utils import noise_model_batch, generate_sequences
 
 class Discriminator(nn.Module):
@@ -152,6 +153,70 @@ class MonolingualDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.sentences[idx]
+
+
+def load_nllb_multi_domain(
+    dataset_config_name: str,
+    source_lang: str,
+    target_lang: str,
+    split: str = "train",
+    max_samples: Optional[int] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Load monolingual sentences from breakend/nllb-multi-domain dataset.
+    
+    Args:
+        dataset_config_name: Config name (e.g., "en-fr", "en-de")
+        source_lang: Source language code (e.g., "en", "fr")
+        target_lang: Target language code (e.g., "fr", "de")
+        split: Dataset split ("train", "validation", "test")
+        max_samples: Maximum number of samples to load (None for all)
+        
+    Returns:
+        Tuple of (source_sentences, target_sentences)
+    """
+    print(f"Loading dataset: breakend/nllb-multi-domain ({dataset_config_name})")
+    dataset = load_dataset("breakend/nllb-multi-domain", dataset_config_name, trust_remote_code=True)
+    
+    # Resolve split name
+    split_names = {
+        "train": ["train", "training"],
+        "validation": ["valid", "validation", "val"],
+        "test": ["test", "test_final"],
+    }
+    
+    data_split = None
+    for split_name in split_names.get(split, [split]):
+        if split_name in dataset:
+            data_split = dataset[split_name]
+            break
+    
+    if data_split is None:
+        raise ValueError(f"Split '{split}' not found in dataset. Available: {list(dataset.keys())}")
+    
+    # Extract sentences using column naming convention: sentence_{lang}
+    src_col = f"sentence_{source_lang}"
+    tgt_col = f"sentence_{target_lang}"
+    
+    # Check if columns exist
+    available_cols = data_split.column_names
+    if src_col not in available_cols:
+        raise ValueError(f"Source column '{src_col}' not found. Available: {available_cols}")
+    if tgt_col not in available_cols:
+        raise ValueError(f"Target column '{tgt_col}' not found. Available: {available_cols}")
+    
+    # Extract sentences
+    if max_samples is not None:
+        data_split = data_split.select(range(min(max_samples, len(data_split))))
+    
+    src_sentences = data_split[src_col]
+    tgt_sentences = data_split[tgt_col]
+    
+    print(f"Loaded {len(src_sentences)} sentence pairs from '{split}' split")
+    print(f"  Source column: {src_col}")
+    print(f"  Target column: {tgt_col}")
+    
+    return src_sentences, tgt_sentences
 
 
 class AutoEncodingTrainer:
@@ -887,53 +952,76 @@ class AutoEncodingTrainer:
 # EXAMPLE USAGE
 # =============================================================================
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Unsupervised NMT Training")
+    parser.add_argument("--dataset_config", type=str, default="en-fr",
+                        help="Dataset config name (e.g., 'en-fr', 'en-de')")
+    parser.add_argument("--source_lang", type=str, default="en",
+                        help="Source language code for dataset columns (e.g., 'en')")
+    parser.add_argument("--target_lang", type=str, default="fr",
+                        help="Target language code for dataset columns (e.g., 'fr')")
+    parser.add_argument("--src_lang_nllb", type=str, default="eng_Latn",
+                        help="NLLB source language token (e.g., 'eng_Latn')")
+    parser.add_argument("--tgt_lang_nllb", type=str, default="fra_Latn",
+                        help="NLLB target language token (e.g., 'fra_Latn')")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Maximum number of samples to load (None for all)")
+    parser.add_argument("--num_epochs", type=int, default=3,
+                        help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="Batch size")
+    parser.add_argument("--enc_dec_lr", type=float, default=1e-4,
+                        help="Encoder/decoder learning rate")
+    parser.add_argument("--disc_lr", type=float, default=1e-4,
+                        help="Discriminator learning rate")
+    parser.add_argument("--lambda_auto", type=float, default=1.0,
+                        help="Auto-encoding loss weight")
+    parser.add_argument("--lambda_cd", type=float, default=1.0,
+                        help="Cross-domain loss weight")
+    parser.add_argument("--lambda_adv", type=float, default=1.0,
+                        help="Adversarial loss weight")
+    parser.add_argument("--noise_pwd", type=float, default=0.1,
+                        help="Word dropout probability")
+    parser.add_argument("--noise_k", type=int, default=3,
+                        help="Max shuffle distance")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log every N steps")
+    args = parser.parse_args()
+    
+    # Load dataset from breakend/nllb-multi-domain
+    src_sentences, tgt_sentences = load_nllb_multi_domain(
+        dataset_config_name=args.dataset_config,
+        source_lang=args.source_lang,
+        target_lang=args.target_lang,
+        split="train",
+        max_samples=args.max_samples,
+    )
+    
     # Initialize trainer with auto-encoding, cross-domain, and adversarial components
     trainer = AutoEncodingTrainer(
         model_name="facebook/nllb-200-distilled-600m",
-        src_lang="eng_Latn",
-        tgt_lang="fra_Latn",
-        noise_pwd=0.1,      # 10% word dropout
-        noise_k=3,          # Max shuffle distance
-        lambda_auto=1.0,    # Auto-encoding loss weight
-        lambda_cd=1.0,      # Cross-domain loss weight
-        lambda_adv=1.0,     # Adversarial loss weight
+        src_lang=args.src_lang_nllb,
+        tgt_lang=args.tgt_lang_nllb,
+        noise_pwd=args.noise_pwd,
+        noise_k=args.noise_k,
+        lambda_auto=args.lambda_auto,
+        lambda_cd=args.lambda_cd,
+        lambda_adv=args.lambda_adv,
         disc_hidden_dim=1024,
         disc_smoothing=0.1,
     )
-    
-    # Example monolingual sentences (replace with your data)
-    src_sentences = [
-        "Hello, how are you?",
-        "The weather is nice today.",
-        "I like to read books.",
-        "Machine learning is interesting.",
-        "The cat sat on the mat.",
-        "This is a test sentence.",
-        "Python is a great programming language.",
-        "Natural language processing is fun.",
-    ]
-    
-    tgt_sentences = [
-        "Bonjour, comment allez-vous?",
-        "Le temps est beau aujourd'hui.",
-        "J'aime lire des livres.",
-        "L'apprentissage automatique est intéressant.",
-        "Le chat était assis sur le tapis.",
-        "Ceci est une phrase de test.",
-        "Python est un excellent langage de programmation.",
-        "Le traitement du langage naturel est amusant.",
-    ]
     
     # Single training step example
     print("\n" + "="*70)
     print("SINGLE STEP EXAMPLE")
     print("="*70)
     
-    enc_dec_optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-4)
-    disc_optimizer = torch.optim.AdamW(trainer.discriminator.parameters(), lr=1e-4)
+    enc_dec_optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=args.enc_dec_lr)
+    disc_optimizer = torch.optim.AdamW(trainer.discriminator.parameters(), lr=args.disc_lr)
     
     losses = trainer.train_step(
-        src_sentences[:4], tgt_sentences[:4],
+        src_sentences[:args.batch_size], tgt_sentences[:args.batch_size],
         enc_dec_optimizer, disc_optimizer
     )
     
@@ -960,11 +1048,11 @@ if __name__ == "__main__":
     trainer.train(
         src_sentences=src_sentences,
         tgt_sentences=tgt_sentences,
-        num_epochs=3,
-        batch_size=4,
-        enc_dec_lr=1e-4,
-        disc_lr=1e-4,
-        log_interval=1,
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        enc_dec_lr=args.enc_dec_lr,
+        disc_lr=args.disc_lr,
+        log_interval=args.log_interval,
     )
     
     print("\nAuto-encoding + Cross-Domain + Adversarial training completed!")
