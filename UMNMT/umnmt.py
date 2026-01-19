@@ -28,7 +28,7 @@ Training objective:
         - L_adv_cd: adversarial loss on cross-domain intermediate encoder outputs
     L_disc = L_D (trained separately)
 """
-
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from typing import List, Optional, Dict, Tuple
 from datasets import load_dataset
+import sacrebleu
 from utils import noise_model_batch, generate_sequences
 
 class Discriminator(nn.Module):
@@ -166,9 +167,9 @@ def load_nllb_multi_domain(
     Load monolingual sentences from breakend/nllb-multi-domain dataset.
     
     Args:
-        dataset_config_name: Config name (e.g., "en-fr", "en-de")
-        source_lang: Source language code (e.g., "en", "fr")
-        target_lang: Target language code (e.g., "fr", "de")
+        dataset_config_name: Config name (e.g., "eng_Latn-wol_Latn", "eng_Latn-ayr_Latn")
+        source_lang: Source language code (e.g., "eng_Latn", "ayr_Latn")
+        target_lang: Target language code (e.g., "wol_Latn", "ayr_Latn")
         split: Dataset split ("train", "validation", "test")
         max_samples: Maximum number of samples to load (None for all)
         
@@ -219,7 +220,7 @@ def load_nllb_multi_domain(
     return src_sentences, tgt_sentences
 
 
-class AutoEncodingTrainer:
+class UMNMTTrainer:
     """
     Trainer for Denoising Auto-Encoding + Cross-Domain + Adversarial Training.
     
@@ -253,11 +254,12 @@ class AutoEncodingTrainer:
         self.lambda_auto = lambda_auto
         self.lambda_cd = lambda_cd
         self.lambda_adv = lambda_adv
-        
         # Load model and tokenizer
         print(f"Loading model: {model_name}")
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # clone the model to self.prev_model
+        self.prev_model = copy.deepcopy(self.model)
         
         # Language token IDs
         self.src_lang_id = self.tokenizer.convert_tokens_to_ids(src_lang)
@@ -364,7 +366,7 @@ class AutoEncodingTrainer:
         
         # Generate sequence ids 
         generated_sequences = generate_sequences(
-            self.model,
+            self.prev_model,
             self.tokenizer,
             noisy_inputs,
             tgt_lang_id=lang_id,
@@ -434,7 +436,7 @@ class AutoEncodingTrainer:
         # Step 2: Translate to target language (src → tgt)
         with torch.no_grad():
             translated_sequences = generate_sequences(
-                self.model,
+                self.prev_model, # as in the paper use the previous model to translate for cross-domain loss
                 self.tokenizer,
                 original_inputs,
                 tgt_lang_id=tgt_lang_id,
@@ -767,80 +769,205 @@ class AutoEncodingTrainer:
         }
     
     @torch.no_grad()
+    def translate(
+        self,
+        sentences: List[str],
+        tgt_lang_id: int,
+        max_new_tokens: int = 128,
+    ) -> List[str]:
+        """
+        Translate a batch of sentences using greedy decoding.
+        
+        Args:
+            sentences: List of source sentences
+            tgt_lang_id: Target language token ID
+            max_new_tokens: Maximum tokens to generate
+            
+        Returns:
+            List of translated sentences
+        """
+        self.model.eval()
+        inputs = self._tokenize(sentences)
+        
+        generated_sequences = generate_sequences(
+            self.model,
+            self.tokenizer,
+            inputs,
+            tgt_lang_id=tgt_lang_id,
+            max_new_tokens=max_new_tokens,
+            gen_temperature=1.0,
+            num_return_sequences=1,
+            do_sample=False,  # Greedy decoding
+        )
+        
+        translations = self.tokenizer.batch_decode(
+            generated_sequences, skip_special_tokens=True
+        )
+        return translations
+    
+    @torch.no_grad()
     def evaluate(
         self,
         src_sentences: List[str],
         tgt_sentences: List[str],
     ) -> Dict[str, float]:
         """
-        Evaluate losses without gradient computation.
+        Evaluate translation quality using chrF++ and spBLEU metrics.
+        
+        Uses greedy decoding for translations.
         
         Args:
-            src_sentences: Batch of source language sentences
-            tgt_sentences: Batch of target language sentences
+            src_sentences: Source language sentences (used as references for tgt→src)
+            tgt_sentences: Target language sentences (used as references for src→tgt)
             
         Returns:
-            Dictionary of loss values and metrics
+            Dictionary with chrF++ and spBLEU scores for both directions
         """
         self.model.eval()
-        self.discriminator.eval()
         
-        # Auto-encoding losses
-        loss_auto_src, metrics_auto_src = self.compute_auto_encoding_loss(
-            src_sentences, self.src_lang_id
-        )
-        loss_auto_tgt, metrics_auto_tgt = self.compute_auto_encoding_loss(
-            tgt_sentences, self.tgt_lang_id
+        # Translate src → tgt (greedy decoding)
+        src_to_tgt_translations = self.translate(
+            src_sentences, self.tgt_lang_id
         )
         
-        # Cross-domain losses (also returns encoder hidden states for adversarial loss)
-        loss_cd_src, metrics_cd_src, cd_tgt_hidden, cd_tgt_mask = self.compute_cross_domain_loss(
-            src_sentences, self.src_lang_id, self.tgt_lang_id
-        )
-        loss_cd_tgt, metrics_cd_tgt, cd_src_hidden, cd_src_mask = self.compute_cross_domain_loss(
-            tgt_sentences, self.tgt_lang_id, self.src_lang_id
+        # Translate tgt → src (greedy decoding)
+        tgt_to_src_translations = self.translate(
+            tgt_sentences, self.src_lang_id
         )
         
-        # Adversarial loss on original sentences
-        loss_adv, hidden_states, attention_masks = self.compute_adversarial_loss(
-            src_sentences, tgt_sentences
+        # Compute chrF++ for src → tgt
+        chrf_src_to_tgt = sacrebleu.corpus_chrf(
+            src_to_tgt_translations,
+            [tgt_sentences],
+            word_order=2,  # chrF++ uses word_order=2
         )
         
-        # Adversarial loss on cross-domain encoder outputs
-        loss_adv_cd = self.compute_adversarial_loss_from_hidden(
-            cd_src_hidden, cd_src_mask, cd_tgt_hidden, cd_tgt_mask
+        # Compute chrF++ for tgt → src
+        chrf_tgt_to_src = sacrebleu.corpus_chrf(
+            tgt_to_src_translations,
+            [src_sentences],
+            word_order=2,
         )
         
-        # Discriminator accuracy
-        src_hidden, tgt_hidden = hidden_states
-        src_mask, tgt_mask = attention_masks
-        src_preds = self.discriminator(src_hidden, src_mask)
-        tgt_preds = self.discriminator(tgt_hidden, tgt_mask)
-        src_acc = (src_preds < 0.5).float().mean()  # src should predict 0
-        tgt_acc = (tgt_preds > 0.5).float().mean()  # tgt should predict 1
-        disc_acc = (src_acc + tgt_acc) / 2
+        # Compute spBLEU for src → tgt (using flores200 tokenizer for NLLB)
+        bleu_src_to_tgt = sacrebleu.corpus_bleu(
+            src_to_tgt_translations,
+            [tgt_sentences],
+            tokenize="flores200",
+        )
         
-        # Total loss (same as training)
-        total_loss = (
-            self.lambda_auto * (loss_auto_src + loss_auto_tgt) +
-            self.lambda_cd * (loss_cd_src + loss_cd_tgt) +
-            self.lambda_adv * (loss_adv + loss_adv_cd)
+        # Compute spBLEU for tgt → src
+        bleu_tgt_to_src = sacrebleu.corpus_bleu(
+            tgt_to_src_translations,
+            [src_sentences],
+            tokenize="flores200",
         )
         
         return {
-            "loss_total": total_loss.item(),
-            "loss_auto_src": loss_auto_src.item(),
-            "loss_auto_tgt": loss_auto_tgt.item(),
-            "loss_cd_src": loss_cd_src.item(),
-            "loss_cd_tgt": loss_cd_tgt.item(),
-            "loss_adv": loss_adv.item(),
-            "loss_adv_cd": loss_adv_cd.item(),
-            "acc_auto_src": metrics_auto_src["accuracy"],
-            "acc_auto_tgt": metrics_auto_tgt["accuracy"],
-            "acc_cd_src": metrics_cd_src["accuracy"],
-            "acc_cd_tgt": metrics_cd_tgt["accuracy"],
-            "disc_acc": disc_acc.item(),
+            "chrf++_src_to_tgt": chrf_src_to_tgt.score,
+            "chrf++_tgt_to_src": chrf_tgt_to_src.score,
+            "spbleu_src_to_tgt": bleu_src_to_tgt.score,
+            "spbleu_tgt_to_src": bleu_tgt_to_src.score,
+            "chrf++_avg": (chrf_src_to_tgt.score + chrf_tgt_to_src.score) / 2,
+            "spbleu_avg": (bleu_src_to_tgt.score + bleu_tgt_to_src.score) / 2,
         }
+    
+    def run_evaluation(
+        self,
+        src_sentences: List[str],
+        tgt_sentences: List[str],
+        batch_size: int = 32,
+        split_name: str = "Validation",
+    ) -> Dict[str, float]:
+        """
+        Run evaluation on a full dataset split using chrF++ and spBLEU.
+        
+        Translates in batches but computes corpus-level metrics on all translations.
+        
+        Args:
+            src_sentences: List of source language sentences
+            tgt_sentences: List of target language sentences
+            batch_size: Batch size for translation
+            split_name: Name of the split for logging (e.g., "Validation", "Test")
+            
+        Returns:
+            Dictionary with chrF++ and spBLEU scores
+        """
+        self.model.eval()
+        
+        # Collect all translations
+        all_src_to_tgt = []
+        all_tgt_to_src = []
+        
+        src_loader = DataLoader(
+            MonolingualDataset(src_sentences),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        tgt_loader = DataLoader(
+            MonolingualDataset(tgt_sentences),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        
+        print(f"\n{split_name}: Translating {len(src_sentences)} sentence pairs...")
+        
+        # Translate src → tgt in batches
+        for src_batch in src_loader:
+            translations = self.translate(src_batch, self.tgt_lang_id)
+            all_src_to_tgt.extend(translations)
+        
+        # Translate tgt → src in batches
+        for tgt_batch in tgt_loader:
+            translations = self.translate(tgt_batch, self.src_lang_id)
+            all_tgt_to_src.extend(translations)
+        
+        # Compute corpus-level chrF++ and spBLEU
+        chrf_src_to_tgt = sacrebleu.corpus_chrf(
+            all_src_to_tgt,
+            [list(tgt_sentences)],
+            word_order=2,
+        )
+        
+        chrf_tgt_to_src = sacrebleu.corpus_chrf(
+            all_tgt_to_src,
+            [list(src_sentences)],
+            word_order=2,
+        )
+        
+        bleu_src_to_tgt = sacrebleu.corpus_bleu(
+            all_src_to_tgt,
+            [list(tgt_sentences)],
+            tokenize="flores200",
+        )
+        
+        bleu_tgt_to_src = sacrebleu.corpus_bleu(
+            all_tgt_to_src,
+            [list(src_sentences)],
+            tokenize="flores200",
+        )
+        
+        metrics = {
+            "chrf++_src_to_tgt": chrf_src_to_tgt.score,
+            "chrf++_tgt_to_src": chrf_tgt_to_src.score,
+            "spbleu_src_to_tgt": bleu_src_to_tgt.score,
+            "spbleu_tgt_to_src": bleu_tgt_to_src.score,
+            "chrf++_avg": (chrf_src_to_tgt.score + chrf_tgt_to_src.score) / 2,
+            "spbleu_avg": (bleu_src_to_tgt.score + bleu_tgt_to_src.score) / 2,
+        }
+        
+        # Print summary
+        print(f"{'-'*70}")
+        print(f"{split_name} Results ({len(src_sentences)} pairs):")
+        print(f"  chrF++ (src→tgt): {metrics['chrf++_src_to_tgt']:.2f}")
+        print(f"  chrF++ (tgt→src): {metrics['chrf++_tgt_to_src']:.2f}")
+        print(f"  chrF++ (avg):     {metrics['chrf++_avg']:.2f}")
+        print(f"  spBLEU (src→tgt): {metrics['spbleu_src_to_tgt']:.2f}")
+        print(f"  spBLEU (tgt→src): {metrics['spbleu_tgt_to_src']:.2f}")
+        print(f"  spBLEU (avg):     {metrics['spbleu_avg']:.2f}")
+        print(f"{'-'*70}")
+        
+        return metrics
     
     def train(
         self,
@@ -851,18 +978,28 @@ class AutoEncodingTrainer:
         enc_dec_lr: float = 1e-4,
         disc_lr: float = 1e-4,
         log_interval: int = 10,
+        val_src_sentences: Optional[List[str]] = None,
+        val_tgt_sentences: Optional[List[str]] = None,
+        test_src_sentences: Optional[List[str]] = None,
+        test_tgt_sentences: Optional[List[str]] = None,
+        val_batch_size: int = 16,
     ):
         """
         Training loop for auto-encoding + adversarial training.
         
         Args:
-            src_sentences: List of source language sentences
-            tgt_sentences: List of target language sentences
+            src_sentences: List of source language sentences (train)
+            tgt_sentences: List of target language sentences (train)
             num_epochs: Number of training epochs
             batch_size: Batch size
             enc_dec_lr: Learning rate for encoder/decoder
             disc_lr: Learning rate for discriminator
             log_interval: Log every N steps
+            val_src_sentences: Validation source sentences (optional)
+            val_tgt_sentences: Validation target sentences (optional)
+            test_src_sentences: Test source sentences (optional)
+            test_tgt_sentences: Test target sentences (optional)
+            val_batch_size: Batch size for validation/test
         """
         # Create data loaders
         src_loader = DataLoader(
@@ -880,11 +1017,22 @@ class AutoEncodingTrainer:
         enc_dec_optimizer = torch.optim.AdamW(self.model.parameters(), lr=enc_dec_lr)
         disc_optimizer = torch.optim.AdamW(self.discriminator.parameters(), lr=disc_lr)
         
+        # Check if validation/test data is provided
+        has_validation = val_src_sentences is not None and val_tgt_sentences is not None
+        has_test = test_src_sentences is not None and test_tgt_sentences is not None
+        
         print(f"\nStarting training:")
-        print(f"  - Source sentences: {len(src_sentences)}")
-        print(f"  - Target sentences: {len(tgt_sentences)}")
+        print(f"  - Train source sentences: {len(src_sentences)}")
+        print(f"  - Train target sentences: {len(tgt_sentences)}")
+        if has_validation:
+            print(f"  - Val source sentences: {len(val_src_sentences)}")
+            print(f"  - Val target sentences: {len(val_tgt_sentences)}")
+        if has_test:
+            print(f"  - Test source sentences: {len(test_src_sentences)}")
+            print(f"  - Test target sentences: {len(test_tgt_sentences)}")
         print(f"  - Epochs: {num_epochs}")
         print(f"  - Batch size: {batch_size}")
+        print(f"  - Val/Test batch size: {val_batch_size}")
         print(f"  - Enc/Dec LR: {enc_dec_lr}")
         print(f"  - Disc LR: {disc_lr}")
         print(f"  - Lambda auto: {self.lambda_auto}")
@@ -906,7 +1054,8 @@ class AutoEncodingTrainer:
                 )
                 epoch_losses.append(losses)
                 global_step += 1
-                
+                # update the prev_model with the model
+                self.prev_model = copy.deepcopy(self.model)
                 if global_step % log_interval == 0:
                     print(
                         f"Step {global_step:4d} | "
@@ -933,7 +1082,7 @@ class AutoEncodingTrainer:
             avg_disc_acc = sum(l["disc_acc"] for l in epoch_losses) / len(epoch_losses)
             
             print(f"\n{'='*70}")
-            print(f"Epoch {epoch + 1}/{num_epochs} completed")
+            print(f"Epoch {epoch + 1}/{num_epochs} - Training Summary")
             print(f"  Avg Loss (enc/dec): {avg_loss:.4f}")
             print(f"  Avg L_auto: {avg_loss_auto:.4f}")
             print(f"  Avg L_cd: {avg_loss_cd:.4f}")
@@ -945,7 +1094,30 @@ class AutoEncodingTrainer:
             print(f"  Avg Acc (cross-domain src→tgt→src): {avg_acc_cd_src:.2%}")
             print(f"  Avg Acc (cross-domain tgt→src→tgt): {avg_acc_cd_tgt:.2%}")
             print(f"  Avg Discriminator Acc: {avg_disc_acc:.2%}")
+            
+            # Run validation at the end of each epoch
+            if has_validation:
+                self.run_evaluation(
+                    val_src_sentences, val_tgt_sentences,
+                    batch_size=val_batch_size,
+                    split_name=f"Validation (Epoch {epoch + 1})",
+                )
+            
             print(f"{'='*70}\n")
+        
+        # Run test evaluation after training completes
+        if has_test:
+            print("\n" + "="*70)
+            print("FINAL TEST EVALUATION")
+            print("="*70)
+            test_metrics = self.run_evaluation(
+                test_src_sentences, test_tgt_sentences,
+                batch_size=val_batch_size,
+                split_name="Test (Final)",
+            )
+            return test_metrics
+        
+        return None
 
 
 # =============================================================================
@@ -955,12 +1127,12 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Unsupervised NMT Training")
-    parser.add_argument("--dataset_config", type=str, default="en-fr",
-                        help="Dataset config name (e.g., 'en-fr', 'en-de')")
-    parser.add_argument("--source_lang", type=str, default="en",
-                        help="Source language code for dataset columns (e.g., 'en')")
-    parser.add_argument("--target_lang", type=str, default="fr",
-                        help="Target language code for dataset columns (e.g., 'fr')")
+    parser.add_argument("--dataset_config", type=str, default="eng_Latn-wol_Latn",
+                        help="Dataset config name (e.g., 'eng_Latn-wol_Latn', 'eng_Latn-ayr_Latn')")
+    parser.add_argument("--source_lang", type=str, default="eng_Latn",
+                        help="Source language code for dataset columns (e.g., 'eng_Latn')")
+    parser.add_argument("--target_lang", type=str, default="wol_Latn",
+                        help="Target language code for dataset columns (e.g., 'wol_Latn')")
     parser.add_argument("--src_lang_nllb", type=str, default="eng_Latn",
                         help="NLLB source language token (e.g., 'eng_Latn')")
     parser.add_argument("--tgt_lang_nllb", type=str, default="fra_Latn",
@@ -987,9 +1159,23 @@ if __name__ == "__main__":
                         help="Max shuffle distance")
     parser.add_argument("--log_interval", type=int, default=10,
                         help="Log every N steps")
+    parser.add_argument("--val_batch_size", type=int, default=16,
+                        help="Validation/test batch size")
+    parser.add_argument("--max_val_samples", type=int, default=None,
+                        help="Maximum validation samples (None for all)")
+    parser.add_argument("--max_test_samples", type=int, default=None,
+                        help="Maximum test samples (None for all)")
+    parser.add_argument("--skip_validation", action="store_true",
+                        help="Skip validation during training")
+    parser.add_argument("--skip_test", action="store_true",
+                        help="Skip test evaluation after training")
     args = parser.parse_args()
     
-    # Load dataset from breakend/nllb-multi-domain
+    # Load training data from breakend/nllb-multi-domain
+    print("\n" + "="*70)
+    print("LOADING DATASETS")
+    print("="*70)
+    
     src_sentences, tgt_sentences = load_nllb_multi_domain(
         dataset_config_name=args.dataset_config,
         source_lang=args.source_lang,
@@ -997,6 +1183,34 @@ if __name__ == "__main__":
         split="train",
         max_samples=args.max_samples,
     )
+    
+    # Load validation data
+    val_src_sentences, val_tgt_sentences = None, None
+    if not args.skip_validation:
+        try:
+            val_src_sentences, val_tgt_sentences = load_nllb_multi_domain(
+                dataset_config_name=args.dataset_config,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                split="validation",
+                max_samples=args.max_val_samples,
+            )
+        except ValueError as e:
+            print(f"Warning: Could not load validation split: {e}")
+    
+    # Load test data
+    test_src_sentences, test_tgt_sentences = None, None
+    if not args.skip_test:
+        try:
+            test_src_sentences, test_tgt_sentences = load_nllb_multi_domain(
+                dataset_config_name=args.dataset_config,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                split="test",
+                max_samples=args.max_test_samples,
+            )
+        except ValueError as e:
+            print(f"Warning: Could not load test split: {e}")
     
     # Initialize trainer with auto-encoding, cross-domain, and adversarial components
     trainer = AutoEncodingTrainer(
@@ -1012,40 +1226,12 @@ if __name__ == "__main__":
         disc_smoothing=0.1,
     )
     
-    # Single training step example
+    # Full training with validation and test
     print("\n" + "="*70)
-    print("SINGLE STEP EXAMPLE")
+    print("TRAINING (Auto-Encoding + Cross-Domain + Adversarial)")
     print("="*70)
     
-    enc_dec_optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=args.enc_dec_lr)
-    disc_optimizer = torch.optim.AdamW(trainer.discriminator.parameters(), lr=args.disc_lr)
-    
-    losses = trainer.train_step(
-        src_sentences[:args.batch_size], tgt_sentences[:args.batch_size],
-        enc_dec_optimizer, disc_optimizer
-    )
-    
-    print(f"\nSingle step results:")
-    print(f"  Total Enc/Dec Loss: {losses['loss_total']:.4f}")
-    print(f"  L_auto(src): {losses['loss_auto_src']:.4f}")
-    print(f"  L_auto(tgt): {losses['loss_auto_tgt']:.4f}")
-    print(f"  L_cd(src→tgt→src): {losses['loss_cd_src']:.4f}")
-    print(f"  L_cd(tgt→src→tgt): {losses['loss_cd_tgt']:.4f}")
-    print(f"  L_adv (original): {losses['loss_adv']:.4f}")
-    print(f"  L_adv (cross-domain): {losses['loss_adv_cd']:.4f}")
-    print(f"  L_disc: {losses['loss_disc']:.4f}")
-    print(f"  Auto-enc Acc (src): {losses['acc_auto_src']:.2%}")
-    print(f"  Auto-enc Acc (tgt): {losses['acc_auto_tgt']:.2%}")
-    print(f"  Cross-domain Acc (src→tgt→src): {losses['acc_cd_src']:.2%}")
-    print(f"  Cross-domain Acc (tgt→src→tgt): {losses['acc_cd_tgt']:.2%}")
-    print(f"  Discriminator Acc: {losses['disc_acc']:.2%}")
-    
-    # Full training example
-    print("\n" + "="*70)
-    print("FULL TRAINING EXAMPLE (Auto-Encoding + Cross-Domain + Adversarial)")
-    print("="*70)
-    
-    trainer.train(
+    test_metrics = trainer.train(
         src_sentences=src_sentences,
         tgt_sentences=tgt_sentences,
         num_epochs=args.num_epochs,
@@ -1053,6 +1239,21 @@ if __name__ == "__main__":
         enc_dec_lr=args.enc_dec_lr,
         disc_lr=args.disc_lr,
         log_interval=args.log_interval,
+        val_src_sentences=val_src_sentences,
+        val_tgt_sentences=val_tgt_sentences,
+        test_src_sentences=test_src_sentences,
+        test_tgt_sentences=test_tgt_sentences,
+        val_batch_size=args.val_batch_size,
     )
     
-    print("\nAuto-encoding + Cross-Domain + Adversarial training completed!")
+    print("\n" + "="*70)
+    print("TRAINING COMPLETED!")
+    print("="*70)
+    if test_metrics:
+        print(f"\nFinal Test Results:")
+        print(f"  chrF++ (src→tgt): {test_metrics['chrf++_src_to_tgt']:.2f}")
+        print(f"  chrF++ (tgt→src): {test_metrics['chrf++_tgt_to_src']:.2f}")
+        print(f"  chrF++ (avg):     {test_metrics['chrf++_avg']:.2f}")
+        print(f"  spBLEU (src→tgt): {test_metrics['spbleu_src_to_tgt']:.2f}")
+        print(f"  spBLEU (tgt→src): {test_metrics['spbleu_tgt_to_src']:.2f}")
+        print(f"  spBLEU (avg):     {test_metrics['spbleu_avg']:.2f}")
