@@ -1,13 +1,16 @@
 """
-Denoising Auto-Encoding + Adversarial Training for Unsupervised NMT
+Denoising Auto-Encoding + Cross-Domain + Adversarial Training for Unsupervised NMT
 
 This script implements:
 
 1. Auto-Encoding Loss (Equation 1):
     L_auto(θ_enc, θ_dec, Z, ℓ) = E_{x~D_ℓ, x̂~d(e(C(x),ℓ),ℓ)} [Δ(x̂, x)]
+    Pipeline: x → C(x) → encode → decode → x̂ (same language)
 
 2. Cross-Domain Loss (Equation 2):
-    L_cd(θ_enc, θ_dec, Z, ℓ) = E_{x~D_ℓ, x̂~d(e(C(x),ℓ),ℓ)} [Δ(x̂, x)]
+    L_cd(θ_enc, θ_dec, Z, ℓ_src, ℓ_tgt) = E_{x~D_src}[Δ(x̂, x)]
+    Pipeline: x_src → translate to tgt → C(tgt) → translate back to src → x̂_src
+    Also: x_tgt → translate to src → C(src) → translate back to tgt → x̂_tgt
 
 3. Discriminator Loss:
     L_D(θ_D|θ,Z) = -E_{(x_i, ℓ_i)}[log p_D(ℓ_i|e(x_i, ℓ_i))]
@@ -17,7 +20,12 @@ This script implements:
     where ℓ_j = ℓ_1 if ℓ_i = ℓ_2 (flipped labels - encoder fools discriminator)
 
 Training objective:
-    L_enc_dec = λ_auto * [L_auto(src) + L_auto(tgt)] + λ_cd * [L_cd(src,tgt) + L_cd(tgt,src)] + λ_adv * L_adv
+    L_enc_dec = λ_auto * [L_auto(src) + L_auto(tgt)] 
+              + λ_cd * [L_cd(src→tgt→src) + L_cd(tgt→src→tgt)] 
+              + λ_adv * [L_adv + L_adv_cd]
+    where:
+        - L_adv: adversarial loss on original sentence encoder outputs
+        - L_adv_cd: adversarial loss on cross-domain intermediate encoder outputs
     L_disc = L_D (trained separately)
 """
 
@@ -148,12 +156,14 @@ class MonolingualDataset(Dataset):
 
 class AutoEncodingTrainer:
     """
-    Trainer for Denoising Auto-Encoding + Adversarial Training.
+    Trainer for Denoising Auto-Encoding + Cross-Domain + Adversarial Training.
     
     Implements:
-        1. Auto-encoding: src → C(src) → encode → decode → src_hat
-        2. Auto-encoding: tgt → C(tgt) → encode → decode → tgt_hat
-        3. Adversarial: encoder fools discriminator (language-agnostic representations)
+        1. Auto-encoding: src → C(src) → encode → decode → src_hat (same lang)
+        2. Auto-encoding: tgt → C(tgt) → encode → decode → tgt_hat (same lang)
+        3. Cross-domain: src → translate to tgt → C(tgt) → translate back to src
+        4. Cross-domain: tgt → translate to src → C(src) → translate back to tgt
+        5. Adversarial: encoder fools discriminator (language-agnostic representations)
     """
     
     def __init__(
@@ -163,6 +173,8 @@ class AutoEncodingTrainer:
         tgt_lang: str = "fra_Latn",
         noise_pwd: float = 0.1,
         noise_k: int = 3,
+        lambda_auto: float = 1.0,
+        lambda_cd: float = 1.0,
         lambda_adv: float = 1.0,
         disc_hidden_dim: int = 1024,
         disc_smoothing: float = 0.1,
@@ -173,6 +185,8 @@ class AutoEncodingTrainer:
         self.tgt_lang = tgt_lang
         self.noise_pwd = noise_pwd
         self.noise_k = noise_k
+        self.lambda_auto = lambda_auto
+        self.lambda_cd = lambda_cd
         self.lambda_adv = lambda_adv
         
         # Load model and tokenizer
@@ -195,6 +209,8 @@ class AutoEncodingTrainer:
         print(f"Source language: {src_lang} (ID: {self.src_lang_id})")
         print(f"Target language: {tgt_lang} (ID: {self.tgt_lang_id})")
         print(f"Discriminator: input_dim={hidden_dim}, hidden_dim={disc_hidden_dim}")
+        print(f"Lambda auto-encoding: {lambda_auto}")
+        print(f"Lambda cross-domain: {lambda_cd}")
         print(f"Lambda adversarial: {lambda_adv}")
         print(f"Device: {self.device}")
     
@@ -315,6 +331,107 @@ class AutoEncodingTrainer:
         
         return loss, metrics
     
+    def compute_cross_domain_loss(
+        self,
+        sentences: List[str],
+        src_lang_id: int,
+        tgt_lang_id: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor]:
+        """
+        Compute Cross-Domain Loss (Equation 2):
+        
+        L_cd(θ_enc, θ_dec, Z, ℓ_src, ℓ_tgt) = E_{x~D_src}[Δ(x̂, x)]
+        
+        Pipeline: x → translate to tgt → C(tgt) → translate back to src → compare with x
+        
+        Steps:
+            1. Sample sentence x from source monolingual data D_src
+            2. Translate to target language: y = M(x, tgt_lang)
+            3. Apply noise: C(y)
+            4. Encode C(y) and get encoder hidden states (for adversarial loss)
+            5. Translate back to source: x̂ = M(C(y), src_lang)
+            6. Compute reconstruction loss: Δ(x̂, x)
+        
+        Args:
+            sentences: Batch of original sentences (in src_lang)
+            src_lang_id: Language token ID for source language (to translate back to)
+            tgt_lang_id: Language token ID for target language (intermediate translation)
+            
+        Returns:
+            loss: Cross-domain reconstruction loss
+            metrics: Dictionary with additional metrics
+            encoder_hidden_states: Encoder outputs from encoding C(y) - for adversarial loss
+            attention_mask: Attention mask for encoder outputs
+        """
+        # Step 1: Tokenize original sentences
+        original_inputs = self._tokenize(sentences)
+        
+        # Step 2: Translate to target language (src → tgt)
+        with torch.no_grad():
+            translated_sequences = generate_sequences(
+                self.model,
+                self.tokenizer,
+                original_inputs,
+                tgt_lang_id=tgt_lang_id,
+                max_new_tokens=128,
+                gen_temperature=0.7,
+                num_return_sequences=1,
+                do_sample=False,  # greedy decoding as in the paper
+            )
+        translated_texts = self.tokenizer.batch_decode(
+            translated_sequences, skip_special_tokens=True
+        )
+        
+        # Step 3: Apply noise to translated sentences C(y)
+        noisy_translated = noise_model_batch(
+            translated_texts, pwd=self.noise_pwd, k=self.noise_k
+        )
+        noisy_translated_inputs = self._tokenize(noisy_translated)
+        
+        # Step 4: Get encoder hidden states for adversarial loss
+        # These are the representations of the noisy translated text (in tgt_lang domain)
+        encoder_outputs = self.model.get_encoder()(
+            input_ids=noisy_translated_inputs["input_ids"],
+            attention_mask=noisy_translated_inputs["attention_mask"],
+        )
+        encoder_hidden_states = encoder_outputs.last_hidden_state
+        attention_mask = noisy_translated_inputs["attention_mask"]
+        
+        # Step 5: Translate back to source language (C(y) → src)
+        back_translated_sequences = generate_sequences(
+            self.model,
+            self.tokenizer,
+            noisy_translated_inputs,
+            tgt_lang_id=src_lang_id,  # translate back to source
+            max_new_tokens=128,
+            gen_temperature=0.7,
+            num_return_sequences=1,
+            do_sample=False,
+        )
+        back_translated_texts = self.tokenizer.batch_decode(
+            back_translated_sequences, skip_special_tokens=True
+        )
+        back_translated_inputs = self._tokenize(back_translated_texts)
+        
+        # Step 6: Compute reconstruction loss against original sentences
+        target_tokens = self._tokenize(sentences)
+        target_ids = target_tokens["input_ids"]
+        
+        loss, logits = self.compute_reconstruction_loss(back_translated_inputs, target_ids)
+        
+        # Compute accuracy (for monitoring)
+        preds = logits.argmax(dim=-1)
+        labels = target_ids[:, 1:]
+        mask = labels != self.tokenizer.pad_token_id
+        accuracy = ((preds == labels) & mask).sum().float() / mask.sum().float()
+        
+        metrics = {
+            "accuracy": accuracy.item(),
+            "num_tokens": mask.sum().item(),
+        }
+        
+        return loss, metrics, encoder_hidden_states, attention_mask
+    
     def _encode_sentences(
         self,
         sentences: List[str],
@@ -324,7 +441,7 @@ class AutoEncodingTrainer:
         
         Args:
             sentences: List of sentences to encode
-            
+        
         Returns:
             encoder_hidden_states: (batch, seq_len, hidden_dim)
             attention_mask: (batch, seq_len)
@@ -337,6 +454,43 @@ class AutoEncodingTrainer:
         )
         
         return encoder_outputs.last_hidden_state, inputs["attention_mask"]
+    
+    def compute_adversarial_loss_from_hidden(
+        self,
+        src_hidden: torch.Tensor,
+        src_mask: torch.Tensor,
+        tgt_hidden: torch.Tensor,
+        tgt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute Adversarial Loss from pre-computed encoder hidden states.
+        
+        L_adv(θ_enc, Z|θ_D) = -E_{(x_i, ℓ_i)}[log p_D(ℓ_j|e(x_i, ℓ_i))]
+        
+        where ℓ_j = ℓ_1 if ℓ_i = ℓ_2 (FLIPPED labels)
+        
+        Args:
+            src_hidden: Encoder hidden states for source-domain text (batch, seq, hidden)
+            src_mask: Attention mask for source hidden states
+            tgt_hidden: Encoder hidden states for target-domain text (batch, seq, hidden)
+            tgt_mask: Attention mask for target hidden states
+            
+        Returns:
+            adv_loss: Adversarial loss for encoder
+        """
+        # Source: true label = 0, flipped label = 1
+        src_disc_preds = self.discriminator(src_hidden, src_mask)
+        src_flipped_labels = torch.ones(src_hidden.size(0), 1, device=self.device)
+        loss_adv_src = F.binary_cross_entropy(src_disc_preds, src_flipped_labels)
+        
+        # Target: true label = 1, flipped label = 0
+        tgt_disc_preds = self.discriminator(tgt_hidden, tgt_mask)
+        tgt_flipped_labels = torch.zeros(tgt_hidden.size(0), 1, device=self.device)
+        loss_adv_tgt = F.binary_cross_entropy(tgt_disc_preds, tgt_flipped_labels)
+        
+        adv_loss = (loss_adv_src + loss_adv_tgt) / 2
+        
+        return adv_loss
     
     def compute_adversarial_loss(
         self,
@@ -368,18 +522,10 @@ class AutoEncodingTrainer:
         # Encode target sentences
         tgt_hidden, tgt_mask = self._encode_sentences(tgt_sentences)
         
-        # Separate discriminator calls - no padding needed
-        # Source: true label = 0, flipped label = 1
-        src_disc_preds = self.discriminator(src_hidden, src_mask)
-        src_flipped_labels = torch.ones(src_hidden.size(0), 1, device=self.device)
-        loss_adv_src = F.binary_cross_entropy(src_disc_preds, src_flipped_labels)
-        
-        # Target: true label = 1, flipped label = 0
-        tgt_disc_preds = self.discriminator(tgt_hidden, tgt_mask)
-        tgt_flipped_labels = torch.zeros(tgt_hidden.size(0), 1, device=self.device)
-        loss_adv_tgt = F.binary_cross_entropy(tgt_disc_preds, tgt_flipped_labels)
-        
-        adv_loss = (loss_adv_src + loss_adv_tgt) / 2
+        # Compute adversarial loss using helper method
+        adv_loss = self.compute_adversarial_loss_from_hidden(
+            src_hidden, src_mask, tgt_hidden, tgt_mask
+        )
         
         return adv_loss, (src_hidden, tgt_hidden), (src_mask, tgt_mask)
     
@@ -456,32 +602,61 @@ class AutoEncodingTrainer:
         # STEP 1: Compute Auto-Encoding Losses
         # =====================================================================
         
-        # L_auto(src): src → src_hat
-        loss_auto_src, metrics_src = self.compute_auto_encoding_loss(
+        # L_auto(src): src → C(src) → src_hat
+        loss_auto_src, metrics_auto_src = self.compute_auto_encoding_loss(
             src_sentences, self.src_lang_id
         )
         
-        # L_auto(tgt): tgt → tgt_hat
-        loss_auto_tgt, metrics_tgt = self.compute_auto_encoding_loss(
+        # L_auto(tgt): tgt → C(tgt) → tgt_hat
+        loss_auto_tgt, metrics_auto_tgt = self.compute_auto_encoding_loss(
             tgt_sentences, self.tgt_lang_id
         )
         
         # =====================================================================
-        # STEP 2: Compute Adversarial Loss (encoder fools discriminator)
+        # STEP 2: Compute Cross-Domain Losses
         # =====================================================================
         
+        # L_cd(src→tgt→src): src → translate to tgt → C(tgt) → translate back to src
+        # Also returns encoder hidden states from encoding C(tgt) for adversarial loss
+        loss_cd_src, metrics_cd_src, cd_tgt_hidden, cd_tgt_mask = self.compute_cross_domain_loss(
+            src_sentences, self.src_lang_id, self.tgt_lang_id
+        )
+        
+        # L_cd(tgt→src→tgt): tgt → translate to src → C(src) → translate back to tgt
+        # Also returns encoder hidden states from encoding C(src) for adversarial loss
+        loss_cd_tgt, metrics_cd_tgt, cd_src_hidden, cd_src_mask = self.compute_cross_domain_loss(
+            tgt_sentences, self.tgt_lang_id, self.src_lang_id
+        )
+        
+        # =====================================================================
+        # STEP 3: Compute Adversarial Loss (encoder fools discriminator)
+        # =====================================================================
+        
+        # Adversarial loss on original sentences
         loss_adv, hidden_states, attention_masks = self.compute_adversarial_loss(
             src_sentences, tgt_sentences
         )
         
+        # Adversarial loss on cross-domain encoder outputs
+        # cd_src_hidden: encoder output when encoding C(src) (in tgt→src→tgt pipeline)
+        # cd_tgt_hidden: encoder output when encoding C(tgt) (in src→tgt→src pipeline)
+        loss_adv_cd = self.compute_adversarial_loss_from_hidden(
+            cd_src_hidden, cd_src_mask, cd_tgt_hidden, cd_tgt_mask
+        )
+        
         # =====================================================================
-        # STEP 3: Update Encoder/Decoder
+        # STEP 4: Update Encoder/Decoder
         # =====================================================================
         
-        # Total encoder/decoder loss
+        # Total encoder/decoder loss (Equation from paper)
+        # L_enc_dec = λ_auto * [L_auto(src) + L_auto(tgt)] 
+        #           + λ_cd * [L_cd(src,tgt) + L_cd(tgt,src)] 
+        #           + λ_adv * [L_adv + L_adv_cd]
+        # where L_adv is on original sentences, L_adv_cd is on cross-domain encoder outputs
         loss_enc_dec = (
-            loss_auto_src + loss_auto_tgt + 
-            self.lambda_adv * loss_adv
+            self.lambda_auto * (loss_auto_src + loss_auto_tgt) +
+            self.lambda_cd * (loss_cd_src + loss_cd_tgt) +
+            self.lambda_adv * (loss_adv + loss_adv_cd)
         )
         
         enc_dec_optimizer.zero_grad()
@@ -489,7 +664,7 @@ class AutoEncodingTrainer:
         enc_dec_optimizer.step()
         
         # =====================================================================
-        # STEP 4: Update Discriminator (trained to classify correctly)
+        # STEP 5: Update Discriminator (trained to classify correctly)
         # =====================================================================
         
         loss_disc = self.compute_discriminator_loss(hidden_states, attention_masks)
@@ -514,10 +689,15 @@ class AutoEncodingTrainer:
             "loss_total": loss_enc_dec.item(),
             "loss_auto_src": loss_auto_src.item(),
             "loss_auto_tgt": loss_auto_tgt.item(),
+            "loss_cd_src": loss_cd_src.item(),
+            "loss_cd_tgt": loss_cd_tgt.item(),
             "loss_adv": loss_adv.item(),
+            "loss_adv_cd": loss_adv_cd.item(),
             "loss_disc": loss_disc.item(),
-            "acc_src": metrics_src["accuracy"],
-            "acc_tgt": metrics_tgt["accuracy"],
+            "acc_auto_src": metrics_auto_src["accuracy"],
+            "acc_auto_tgt": metrics_auto_tgt["accuracy"],
+            "acc_cd_src": metrics_cd_src["accuracy"],
+            "acc_cd_tgt": metrics_cd_tgt["accuracy"],
             "disc_acc": disc_acc.item(),
         }
     
@@ -541,16 +721,29 @@ class AutoEncodingTrainer:
         self.discriminator.eval()
         
         # Auto-encoding losses
-        loss_src, metrics_src = self.compute_auto_encoding_loss(
+        loss_auto_src, metrics_auto_src = self.compute_auto_encoding_loss(
             src_sentences, self.src_lang_id
         )
-        loss_tgt, metrics_tgt = self.compute_auto_encoding_loss(
+        loss_auto_tgt, metrics_auto_tgt = self.compute_auto_encoding_loss(
             tgt_sentences, self.tgt_lang_id
         )
         
-        # Adversarial loss
+        # Cross-domain losses (also returns encoder hidden states for adversarial loss)
+        loss_cd_src, metrics_cd_src, cd_tgt_hidden, cd_tgt_mask = self.compute_cross_domain_loss(
+            src_sentences, self.src_lang_id, self.tgt_lang_id
+        )
+        loss_cd_tgt, metrics_cd_tgt, cd_src_hidden, cd_src_mask = self.compute_cross_domain_loss(
+            tgt_sentences, self.tgt_lang_id, self.src_lang_id
+        )
+        
+        # Adversarial loss on original sentences
         loss_adv, hidden_states, attention_masks = self.compute_adversarial_loss(
             src_sentences, tgt_sentences
+        )
+        
+        # Adversarial loss on cross-domain encoder outputs
+        loss_adv_cd = self.compute_adversarial_loss_from_hidden(
+            cd_src_hidden, cd_src_mask, cd_tgt_hidden, cd_tgt_mask
         )
         
         # Discriminator accuracy
@@ -562,15 +755,25 @@ class AutoEncodingTrainer:
         tgt_acc = (tgt_preds > 0.5).float().mean()  # tgt should predict 1
         disc_acc = (src_acc + tgt_acc) / 2
         
-        total_loss = loss_src + loss_tgt + self.lambda_adv * loss_adv
+        # Total loss (same as training)
+        total_loss = (
+            self.lambda_auto * (loss_auto_src + loss_auto_tgt) +
+            self.lambda_cd * (loss_cd_src + loss_cd_tgt) +
+            self.lambda_adv * (loss_adv + loss_adv_cd)
+        )
         
         return {
             "loss_total": total_loss.item(),
-            "loss_auto_src": loss_src.item(),
-            "loss_auto_tgt": loss_tgt.item(),
+            "loss_auto_src": loss_auto_src.item(),
+            "loss_auto_tgt": loss_auto_tgt.item(),
+            "loss_cd_src": loss_cd_src.item(),
+            "loss_cd_tgt": loss_cd_tgt.item(),
             "loss_adv": loss_adv.item(),
-            "acc_src": metrics_src["accuracy"],
-            "acc_tgt": metrics_tgt["accuracy"],
+            "loss_adv_cd": loss_adv_cd.item(),
+            "acc_auto_src": metrics_auto_src["accuracy"],
+            "acc_auto_tgt": metrics_auto_tgt["accuracy"],
+            "acc_cd_src": metrics_cd_src["accuracy"],
+            "acc_cd_tgt": metrics_cd_tgt["accuracy"],
             "disc_acc": disc_acc.item(),
         }
     
@@ -619,6 +822,8 @@ class AutoEncodingTrainer:
         print(f"  - Batch size: {batch_size}")
         print(f"  - Enc/Dec LR: {enc_dec_lr}")
         print(f"  - Disc LR: {disc_lr}")
+        print(f"  - Lambda auto: {self.lambda_auto}")
+        print(f"  - Lambda cd: {self.lambda_cd}")
         print(f"  - Lambda adv: {self.lambda_adv}")
         print(f"  - Noise dropout: {self.noise_pwd}")
         print(f"  - Noise shuffle k: {self.noise_k}")
@@ -641,28 +846,39 @@ class AutoEncodingTrainer:
                     print(
                         f"Step {global_step:4d} | "
                         f"L_total: {losses['loss_total']:.4f} "
-                        f"(auto_src: {losses['loss_auto_src']:.4f}, "
-                        f"auto_tgt: {losses['loss_auto_tgt']:.4f}, "
-                        f"adv: {losses['loss_adv']:.4f}) | "
+                        f"(auto: {losses['loss_auto_src'] + losses['loss_auto_tgt']:.4f}, "
+                        f"cd: {losses['loss_cd_src'] + losses['loss_cd_tgt']:.4f}, "
+                        f"adv: {losses['loss_adv']:.4f}, "
+                        f"adv_cd: {losses['loss_adv_cd']:.4f}) | "
                         f"L_disc: {losses['loss_disc']:.4f} | "
                         f"Disc acc: {losses['disc_acc']:.2%}"
                     )
             
             # Epoch summary
             avg_loss = sum(l["loss_total"] for l in epoch_losses) / len(epoch_losses)
+            avg_loss_auto = sum(l["loss_auto_src"] + l["loss_auto_tgt"] for l in epoch_losses) / len(epoch_losses)
+            avg_loss_cd = sum(l["loss_cd_src"] + l["loss_cd_tgt"] for l in epoch_losses) / len(epoch_losses)
             avg_loss_adv = sum(l["loss_adv"] for l in epoch_losses) / len(epoch_losses)
+            avg_loss_adv_cd = sum(l["loss_adv_cd"] for l in epoch_losses) / len(epoch_losses)
             avg_loss_disc = sum(l["loss_disc"] for l in epoch_losses) / len(epoch_losses)
-            avg_acc_src = sum(l["acc_src"] for l in epoch_losses) / len(epoch_losses)
-            avg_acc_tgt = sum(l["acc_tgt"] for l in epoch_losses) / len(epoch_losses)
+            avg_acc_auto_src = sum(l["acc_auto_src"] for l in epoch_losses) / len(epoch_losses)
+            avg_acc_auto_tgt = sum(l["acc_auto_tgt"] for l in epoch_losses) / len(epoch_losses)
+            avg_acc_cd_src = sum(l["acc_cd_src"] for l in epoch_losses) / len(epoch_losses)
+            avg_acc_cd_tgt = sum(l["acc_cd_tgt"] for l in epoch_losses) / len(epoch_losses)
             avg_disc_acc = sum(l["disc_acc"] for l in epoch_losses) / len(epoch_losses)
             
             print(f"\n{'='*70}")
             print(f"Epoch {epoch + 1}/{num_epochs} completed")
             print(f"  Avg Loss (enc/dec): {avg_loss:.4f}")
-            print(f"  Avg L_adv: {avg_loss_adv:.4f}")
+            print(f"  Avg L_auto: {avg_loss_auto:.4f}")
+            print(f"  Avg L_cd: {avg_loss_cd:.4f}")
+            print(f"  Avg L_adv (original): {avg_loss_adv:.4f}")
+            print(f"  Avg L_adv (cross-domain): {avg_loss_adv_cd:.4f}")
             print(f"  Avg L_disc: {avg_loss_disc:.4f}")
-            print(f"  Avg Acc (src reconstruction): {avg_acc_src:.2%}")
-            print(f"  Avg Acc (tgt reconstruction): {avg_acc_tgt:.2%}")
+            print(f"  Avg Acc (auto-enc src): {avg_acc_auto_src:.2%}")
+            print(f"  Avg Acc (auto-enc tgt): {avg_acc_auto_tgt:.2%}")
+            print(f"  Avg Acc (cross-domain src→tgt→src): {avg_acc_cd_src:.2%}")
+            print(f"  Avg Acc (cross-domain tgt→src→tgt): {avg_acc_cd_tgt:.2%}")
             print(f"  Avg Discriminator Acc: {avg_disc_acc:.2%}")
             print(f"{'='*70}\n")
 
@@ -671,13 +887,15 @@ class AutoEncodingTrainer:
 # EXAMPLE USAGE
 # =============================================================================
 if __name__ == "__main__":
-    # Initialize trainer with adversarial component
+    # Initialize trainer with auto-encoding, cross-domain, and adversarial components
     trainer = AutoEncodingTrainer(
         model_name="facebook/nllb-200-distilled-600m",
         src_lang="eng_Latn",
         tgt_lang="fra_Latn",
         noise_pwd=0.1,      # 10% word dropout
         noise_k=3,          # Max shuffle distance
+        lambda_auto=1.0,    # Auto-encoding loss weight
+        lambda_cd=1.0,      # Cross-domain loss weight
         lambda_adv=1.0,     # Adversarial loss weight
         disc_hidden_dim=1024,
         disc_smoothing=0.1,
@@ -723,15 +941,20 @@ if __name__ == "__main__":
     print(f"  Total Enc/Dec Loss: {losses['loss_total']:.4f}")
     print(f"  L_auto(src): {losses['loss_auto_src']:.4f}")
     print(f"  L_auto(tgt): {losses['loss_auto_tgt']:.4f}")
-    print(f"  L_adv: {losses['loss_adv']:.4f}")
+    print(f"  L_cd(src→tgt→src): {losses['loss_cd_src']:.4f}")
+    print(f"  L_cd(tgt→src→tgt): {losses['loss_cd_tgt']:.4f}")
+    print(f"  L_adv (original): {losses['loss_adv']:.4f}")
+    print(f"  L_adv (cross-domain): {losses['loss_adv_cd']:.4f}")
     print(f"  L_disc: {losses['loss_disc']:.4f}")
-    print(f"  Reconstruction Acc (src): {losses['acc_src']:.2%}")
-    print(f"  Reconstruction Acc (tgt): {losses['acc_tgt']:.2%}")
+    print(f"  Auto-enc Acc (src): {losses['acc_auto_src']:.2%}")
+    print(f"  Auto-enc Acc (tgt): {losses['acc_auto_tgt']:.2%}")
+    print(f"  Cross-domain Acc (src→tgt→src): {losses['acc_cd_src']:.2%}")
+    print(f"  Cross-domain Acc (tgt→src→tgt): {losses['acc_cd_tgt']:.2%}")
     print(f"  Discriminator Acc: {losses['disc_acc']:.2%}")
     
     # Full training example
     print("\n" + "="*70)
-    print("FULL TRAINING EXAMPLE (Auto-Encoding + Adversarial)")
+    print("FULL TRAINING EXAMPLE (Auto-Encoding + Cross-Domain + Adversarial)")
     print("="*70)
     
     trainer.train(
@@ -744,4 +967,4 @@ if __name__ == "__main__":
         log_interval=1,
     )
     
-    print("\nAuto-encoding + Adversarial training completed!")
+    print("\nAuto-encoding + Cross-Domain + Adversarial training completed!")
