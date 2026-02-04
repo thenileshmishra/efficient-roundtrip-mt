@@ -14,7 +14,6 @@ def grpo_generate_sequences(
     tokenizer,
     encoder_inputs,
     tgt_lang_id,
-    *,
     max_new_tokens: int,
     gen_temperature: float,
     num_return_sequences: int,
@@ -94,46 +93,6 @@ def grpo_compute_decoder_per_token_logps(
     per_token_logps = _gather_log_probs_from_logits_logits(logits, target_ids)  # (B, L)
     return per_token_logps
 
-# Return the log-probability of the target text given the input text.
-def score_text(model, tokenizer, input_text, target_text):
-    loss = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, reduction='none')
-    # Prepare inputs.
-    input_tokens = tokenizer([input_text], add_special_tokens=False)['input_ids'][0]
-    target_tokens = tokenizer([target_text], add_special_tokens=False)['input_ids'][0]
-    sequence_tokens = input_tokens + target_tokens
-    # Prepend [CLS] to input sequence, to match training format.
-    sequence_tokens.insert(0, tokenizer.cls_token_id)  # Start token.
-    max_seq_len = getattr(tokenizer, "model_max_length", None)
-    if isinstance(max_seq_len, int) and max_seq_len > 0:
-        assert len(sequence_tokens) <= max_seq_len
-    sequence_tokens = torch.tensor([sequence_tokens])
-    if torch.cuda.is_available():
-        sequence_tokens = sequence_tokens.cuda()
-    # Run model.
-    # input_ids shape: (n_examples=1, seq_length). Sequence tokens includes
-    # start of sequence token.
-    outputs = model(input_ids=sequence_tokens,
-                    output_hidden_states=False, return_dict=True)
-    # Logits shape: (n_examples=1, seq_len, vocab_size).
-    logits = outputs['logits'].detach()
-    del outputs
-    # Labels are the ground truth next token for each index.
-    labels = sequence_tokens[:, 1:]  # Shape: (n_examples=1, seq_len-1).
-    # Next token probabilities ignored for last token.
-    logits = logits[:, :-1, :]
-    # To apply loss, logits should be shape: (n_examples=1, vocab_size, seq_len-1).
-    logits = torch.transpose(logits, 1, 2)
-    # Loss shape: (n_examples=1, seq_len-1).
-    # These are negative log probabilities (natural log), corresponding to each
-    # token in sequence_tokens excluding the start token.
-    losses = loss(logits, labels).cpu()
-    # Only consider for the targets, not inputs.
-    losses = losses[0, len(input_tokens):]
-    logprobs = -1.0 * losses
-    # Log-probability of entire target text is the sum of token log-probs.
-    summed_logprobs = torch.sum(logprobs, dim=-1).item()
-    return summed_logprobs
-
 def grpo_compute_loss_and_logs(
     model,
     ref_model,
@@ -146,11 +105,6 @@ def grpo_compute_loss_and_logs(
     beta: float,
     clip_param: float,
     tgt_lang_id: int,
-    length_penalty_weight: float = 0.0,
-    goldfish_model=None,
-    goldfish_tokenizer=None,
-    goldfish_reward_weight: float = 0.5,
-
 ):
     if isinstance(ground_truths, str):
         ground_truths = [ground_truths]
@@ -222,7 +176,8 @@ def grpo_compute_loss_and_logs(
     chrf_mean = chrf_scores_tensor.mean()
     bleu_mean = bleu_scores_tensor.mean()
     # Combine chrF and BLEU equally for rewards
-    combined_scores_tensor = 0.5 * chrf_scores_tensor + 0.5 * bleu_scores_tensor
+    # combined_scores_tensor = 0.5 * chrf_scores_tensor + 0.5 * bleu_scores_tensor
+    combined_scores_tensor = chrf_scores_tensor
     rewards = combined_scores_tensor.reshape(batch_size, num_candidates)
     standardized_rewards = (rewards - rewards.mean(dim=1, keepdim=True)) / (
         rewards.std(dim=1, keepdim=True) + 1e-4

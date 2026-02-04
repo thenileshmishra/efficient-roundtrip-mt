@@ -17,7 +17,6 @@ from utils import (
 )
 from dl import TranslationDataModule
 
-
 def _run_evaluation(
     model: torch.nn.Module,
     tokenizer,
@@ -183,7 +182,7 @@ def train(config: DictConfig):
 
     # Initialize Weights & Biases
     model_name_for_run = str(getattr(config.task.model, "name", "model")).replace("/", "-")
-    run_name = f"{model_name_for_run}_outcome_batch_{config.task.training.batch_size}_src_tgt_src_{target_lang_code}"
+    run_name = f"{model_name_for_run}_outcome_batch_{config.task.training.batch_size}_src_tgt_src_{target_lang_code}_chrf"
     run_wandb = bool(getattr(config.task.training, "use_wandb", True))
     wandb_table = None
     wandb_run = None
@@ -219,7 +218,6 @@ def train(config: DictConfig):
         train_batch_size=int(getattr(config.task.training, "batch_size", 1)),
     )
     data.setup("fit")
-
     val_dataloader = data.val_dataloader() if run_eval else None
     test_dataloader = None
     if run_test:
@@ -260,6 +258,23 @@ def train(config: DictConfig):
         )
         accum_steps_since_update = 0
         optimizer_step = 0
+        
+    if run_test:
+        _run_evaluation(
+            model,
+            tokenizer,
+            test_dataloader,
+            test_eval_cfg,
+            tgt_lang_id=tgt_lang_id,
+            device=policy_device,
+            max_new_tokens=max_new_tokens,
+            split_name="test",
+            step_idx=0,
+            total_training_steps=total_training_steps,
+            wandb_run=wandb_run,
+            wandb_table=wandb_table,
+        )
+        
     if run_eval:
         _run_evaluation(
             model,
@@ -380,7 +395,6 @@ def train(config: DictConfig):
                         beta=beta,
                         clip_param=clip_param,
                         tgt_lang_id=src_lang_id,
-                        length_penalty_weight=float(getattr(config.task.reward, "length_penalty_weight", 0.0)),
                     )
 
                     loss_scale = 1.0 / float(grad_accum_steps)
@@ -457,7 +471,7 @@ def train(config: DictConfig):
                     #     wandb.log({"train/Translations": train_table}, step=step_idx)
                 step_idx += 1
             # Save the model every epoch
-            epoch_save_dir = os.path.join(os.getcwd(), "model", f"{model_name_for_run}_epoch_{epoch}_{target_lang_code}")
+            epoch_save_dir = os.path.join(os.getcwd(), "model", f"{model_name_for_run}_epoch_{epoch}_{target_lang_code}_chrf")
             os.makedirs(epoch_save_dir, exist_ok=True)
             model.save_pretrained(epoch_save_dir)
             tokenizer.save_pretrained(epoch_save_dir)
@@ -493,13 +507,6 @@ def train(config: DictConfig):
             wandb_run=wandb_run,
             wandb_table=wandb_table,
         )
-
-    # Save final model when training occurred
-    if run_training:
-        save_dir = os.path.join(os.getcwd(), "model")
-        os.makedirs(save_dir, exist_ok=True)
-        model.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
 
     if wandb.run is not None:
         wandb.finish()

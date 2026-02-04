@@ -7,9 +7,9 @@ data:
   dataset_config_name: "eng_Latn-rus_Cyrl"
 
 model:
-  # name: "facebook/nllb-200-distilled-1.3B"
-  name: "facebook/nllb-200-distilled-600M"
-  # name: "model/"
+  name: "/workspace/thesis/src/model/facebook-nllb-200-distilled-600M_epoch_0_rus_Cyrl_chrf"
+  # name: "facebook/nllb-200-distilled-600M"
+  # name: /workspace/thesis/src/model/facebook-nllb-200-distilled-600M_epoch_2_wol_Latn
   # name: "facebook/nllb-200-3.3B"
   use_lora: false
   lora:
@@ -23,7 +23,7 @@ model:
 training:
   lr: 0.000002
   accumulate_grad_batches: 1
-  epochs: 3
+  epochs: 1
   batch_size: 2
   num_return_sequences: 4
   updates_per_batch: 1
@@ -46,12 +46,6 @@ test:
   run: true
   translation_metric: ["chrf++"]
 
-reward:
-  # MT reward settings (BLEU and chrF++)
-  bleu_weight: 0.0  # Weight for BLEU score
-  chrf_weight: 0.5  # Weight for chrF++ score
-  length_penalty_weight: 0.1
-  goldfish_reward_weight: 0.4
 constraints: 
   min_sentence_len: 1
   max_sentence_len: 63 # excluding first eos and langid tokens

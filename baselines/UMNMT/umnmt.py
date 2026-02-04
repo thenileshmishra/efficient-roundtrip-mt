@@ -260,7 +260,8 @@ class UMNMTTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         # clone the model to self.prev_model
         self.prev_model = copy.deepcopy(self.model)
-        
+        # eval only
+        self.prev_model.eval()
         # Language token IDs
         self.src_lang_id = self.tokenizer.convert_tokens_to_ids(src_lang)
         self.tgt_lang_id = self.tokenizer.convert_tokens_to_ids(tgt_lang)
@@ -294,34 +295,47 @@ class UMNMTTrainer:
     
     def compute_reconstruction_loss(
         self,
-        noisy_inputs: Dict[str, torch.Tensor],
+        encoder_inputs: Dict[str, torch.Tensor],
         target_ids: torch.Tensor,
+        tgt_lang_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute reconstruction loss: Δ(x̂, x) = sum of token-level cross-entropy.
         
+        Uses teacher forcing: encoder gets noisy input, decoder gets shifted target
+        with target language token prepended.
+        
         Args:
-            noisy_inputs: Tokenized noisy sentences (encoder input)
+            encoder_inputs: Tokenized sentences for encoder (noisy or translated)
             target_ids: Original sentence token IDs (reconstruction target)
+            tgt_lang_id: Target language token ID (prepended to decoder input)
             
         Returns:
             loss: Reconstruction loss
             logits: Model output logits
         """
-        # Shift for decoder input (teacher forcing)
-        decoder_input_ids = target_ids[:, :-1]
-        labels = target_ids[:, 1:]
+        batch_size = target_ids.size(0)
         
-        # Forward pass
+        # Create decoder input: [lang_token, target_ids[:-1]]
+        # Prepend target language token for NLLB
+        lang_tokens = torch.full(
+            (batch_size, 1), tgt_lang_id, dtype=torch.long, device=self.device
+        )
+        # Decoder input: [lang_id, tok1, tok2, ..., tok_{n-1}]
+        decoder_input_ids = torch.cat([lang_tokens, target_ids[:, :-1]], dim=1)
+        # Labels: [tok1, tok2, ..., tok_n] (shifted by 1)
+        labels = target_ids
+        
+        # Forward pass with teacher forcing
         outputs = self.model(
-            input_ids=noisy_inputs["input_ids"],
-            attention_mask=noisy_inputs["attention_mask"],
+            input_ids=encoder_inputs["input_ids"],
+            attention_mask=encoder_inputs["attention_mask"],
             decoder_input_ids=decoder_input_ids,
         )
         
         logits = outputs.logits
         
-        # Compute cross-entropy loss
+        # Compute cross-entropy loss (mean over non-padding tokens)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
@@ -345,13 +359,13 @@ class UMNMTTrainer:
             1. Sample sentence x from monolingual data
             2. Apply noise: C(x)
             3. Encode: e(C(x), ℓ)
-            4. Decode: x̂ ~ d(e(C(x), ℓ), ℓ)
-            5. Compute loss: Δ(x̂, x)
+            4. Decode with teacher forcing: use original x as target
+            5. Compute loss: Δ(decoder_output, x)
         
         Args:
             sentences: Batch of original sentences
             lang_id: Language token ID for this language
-            
+        
         Returns:
             loss: Auto-encoding loss
             metrics: Dictionary with additional metrics
@@ -364,30 +378,17 @@ class UMNMTTrainer:
         # Tokenize noisy sentences (encoder input)
         noisy_inputs = self._tokenize(noisy_sentences)
         
-        # Generate sequence ids 
-        generated_sequences = generate_sequences(
-            self.prev_model,
-            self.tokenizer,
-            noisy_inputs,
-            tgt_lang_id=lang_id,
-            max_new_tokens=128,
-            gen_temperature=0.7,
-            num_return_sequences=1,
-            do_sample=False, # greedy decoding as in the paper 
-        )
-        # detokenize and tokenize again the generated sequences
-        generated_sequences = self.tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
-        generated_inputs = self._tokenize(generated_sequences)
         # Tokenize original sentences (reconstruction target)
         target_tokens = self._tokenize(sentences)
         target_ids = target_tokens["input_ids"]
     
-        # Step 3-5: Encode, decode, compute loss
-        loss, logits = self.compute_reconstruction_loss(generated_inputs, target_ids)
+        # Step 3-5: Encode noisy, decode with teacher forcing to reconstruct original
+        # This is differentiable - gradients flow through encoder and decoder
+        loss, logits = self.compute_reconstruction_loss(noisy_inputs, target_ids, lang_id)
         
         # Compute accuracy (for monitoring)
         preds = logits.argmax(dim=-1)
-        labels = target_ids[:, 1:]
+        labels = target_ids
         mask = labels != self.tokenizer.pad_token_id
         accuracy = ((preds == labels) & mask).sum().float() / mask.sum().float()
         
@@ -409,19 +410,22 @@ class UMNMTTrainer:
         
         L_cd(θ_enc, θ_dec, Z, ℓ_src, ℓ_tgt) = E_{x~D_src}[Δ(x̂, x)]
         
-        Pipeline: x → translate to tgt → C(tgt) → translate back to src → compare with x
+        Pipeline: x → translate to tgt (prev_model) → C(tgt) → encode → decode back to src (teacher forcing)
         
         Steps:
             1. Sample sentence x from source monolingual data D_src
-            2. Translate to target language: y = M(x, tgt_lang)
+            2. Translate to target language using prev_model (no gradient): y = M_prev(x, tgt_lang)
             3. Apply noise: C(y)
-            4. Encode C(y) and get encoder hidden states (for adversarial loss)
-            5. Translate back to source: x̂ = M(C(y), src_lang)
-            6. Compute reconstruction loss: Δ(x̂, x)
+            4. Encode C(y) with current model (gradients flow here)
+            5. Decode back to source with teacher forcing using original x as target
+            6. Compute reconstruction loss: Δ(decoder_output, x)
+        
+        Note: This is differentiable because we use teacher forcing, not generation,
+        for the back-translation step.
         
         Args:
             sentences: Batch of original sentences (in src_lang)
-            src_lang_id: Language token ID for source language (to translate back to)
+            src_lang_id: Language token ID for source language (decoder target)
             tgt_lang_id: Language token ID for target language (intermediate translation)
             
         Returns:
@@ -433,10 +437,11 @@ class UMNMTTrainer:
         # Step 1: Tokenize original sentences
         original_inputs = self._tokenize(sentences)
         
-        # Step 2: Translate to target language (src → tgt)
+        # Step 2: Translate to target language using prev_model (no gradient)
+        # This creates pseudo-parallel data: (x_src, y_tgt)
         with torch.no_grad():
             translated_sequences = generate_sequences(
-                self.prev_model, # as in the paper use the previous model to translate for cross-domain loss
+                self.prev_model,
                 self.tokenizer,
                 original_inputs,
                 tgt_lang_id=tgt_lang_id,
@@ -455,8 +460,7 @@ class UMNMTTrainer:
         )
         noisy_translated_inputs = self._tokenize(noisy_translated)
         
-        # Step 4: Get encoder hidden states for adversarial loss
-        # These are the representations of the noisy translated text (in tgt_lang domain)
+        # Step 4: Encode C(y) - gradients flow through encoder
         encoder_outputs = self.model.get_encoder()(
             input_ids=noisy_translated_inputs["input_ids"],
             attention_mask=noisy_translated_inputs["attention_mask"],
@@ -464,31 +468,20 @@ class UMNMTTrainer:
         encoder_hidden_states = encoder_outputs.last_hidden_state
         attention_mask = noisy_translated_inputs["attention_mask"]
         
-        # Step 5: Translate back to source language (C(y) → src)
-        back_translated_sequences = generate_sequences(
-            self.model,
-            self.tokenizer,
-            noisy_translated_inputs,
-            tgt_lang_id=src_lang_id,  # translate back to source
-            max_new_tokens=128,
-            gen_temperature=0.7,
-            num_return_sequences=1,
-            do_sample=False,
-        )
-        back_translated_texts = self.tokenizer.batch_decode(
-            back_translated_sequences, skip_special_tokens=True
-        )
-        back_translated_inputs = self._tokenize(back_translated_texts)
-        
-        # Step 6: Compute reconstruction loss against original sentences
+        # Step 5-6: Decode back to source with teacher forcing
+        # Encoder input: C(y) (noisy translation in target language)
+        # Decoder target: x (original sentence in source language)
+        # This is differentiable - gradients flow through both encoder and decoder
         target_tokens = self._tokenize(sentences)
         target_ids = target_tokens["input_ids"]
         
-        loss, logits = self.compute_reconstruction_loss(back_translated_inputs, target_ids)
+        loss, logits = self.compute_reconstruction_loss(
+            noisy_translated_inputs, target_ids, src_lang_id
+        )
         
         # Compute accuracy (for monitoring)
         preds = logits.argmax(dim=-1)
-        labels = target_ids[:, 1:]
+        labels = target_ids
         mask = labels != self.tokenizer.pad_token_id
         accuracy = ((preds == labels) & mask).sum().float() / mask.sum().float()
         
@@ -1014,8 +1007,8 @@ class UMNMTTrainer:
         )
         
         # Setup optimizers (separate for encoder/decoder and discriminator)
-        enc_dec_optimizer = torch.optim.AdamW(self.model.parameters(), lr=enc_dec_lr)
-        disc_optimizer = torch.optim.AdamW(self.discriminator.parameters(), lr=disc_lr)
+        enc_dec_optimizer = torch.optim.RMSprop(self.model.parameters(), lr=enc_dec_lr, alpha=0.5)
+        disc_optimizer = torch.optim.RMSprop(self.discriminator.parameters(), lr=disc_lr, alpha=0.5)
         
         # Check if validation/test data is provided
         has_validation = val_src_sentences is not None and val_tgt_sentences is not None
@@ -1041,7 +1034,12 @@ class UMNMTTrainer:
         print(f"  - Noise dropout: {self.noise_pwd}")
         print(f"  - Noise shuffle k: {self.noise_k}")
         print()
-        
+        print(f"Running initial validation...")
+        self.run_evaluation(
+                    val_src_sentences, val_tgt_sentences,
+                    batch_size=val_batch_size,
+                    split_name=f"Validation (Initial)",
+        )
         global_step = 0
         for epoch in range(num_epochs):
             epoch_losses = []
@@ -1054,8 +1052,7 @@ class UMNMTTrainer:
                 )
                 epoch_losses.append(losses)
                 global_step += 1
-                # update the prev_model with the model
-                self.prev_model = copy.deepcopy(self.model)
+                
                 if global_step % log_interval == 0:
                     print(
                         f"Step {global_step:4d} | "
@@ -1103,6 +1100,10 @@ class UMNMTTrainer:
                     split_name=f"Validation (Epoch {epoch + 1})",
                 )
             
+            # Update prev_model at end of epoch (for stable cross-domain translations)
+            self.prev_model = copy.deepcopy(self.model)
+            self.prev_model.eval()
+            
             print(f"{'='*70}\n")
         
         # Run test evaluation after training completes
@@ -1127,25 +1128,21 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Unsupervised NMT Training")
-    parser.add_argument("--dataset_config", type=str, default="eng_Latn-wol_Latn",
+    parser.add_argument("--dataset_config", type=str, default="eng_Latn-ayr_Latn",
                         help="Dataset config name (e.g., 'eng_Latn-wol_Latn', 'eng_Latn-ayr_Latn')")
-    parser.add_argument("--source_lang", type=str, default="eng_Latn",
-                        help="Source language code for dataset columns (e.g., 'eng_Latn')")
-    parser.add_argument("--target_lang", type=str, default="wol_Latn",
-                        help="Target language code for dataset columns (e.g., 'wol_Latn')")
     parser.add_argument("--src_lang_nllb", type=str, default="eng_Latn",
                         help="NLLB source language token (e.g., 'eng_Latn')")
-    parser.add_argument("--tgt_lang_nllb", type=str, default="fra_Latn",
+    parser.add_argument("--tgt_lang_nllb", type=str, default="ayr_Latn",
                         help="NLLB target language token (e.g., 'fra_Latn')")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to load (None for all)")
-    parser.add_argument("--num_epochs", type=int, default=3,
+    parser.add_argument("--num_epochs", type=int, default=2,
                         help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=2,
                         help="Batch size")
-    parser.add_argument("--enc_dec_lr", type=float, default=1e-4,
+    parser.add_argument("--enc_dec_lr", type=float, default=3e-5,
                         help="Encoder/decoder learning rate")
-    parser.add_argument("--disc_lr", type=float, default=1e-4,
+    parser.add_argument("--disc_lr", type=float, default=5e-5,
                         help="Discriminator learning rate")
     parser.add_argument("--lambda_auto", type=float, default=1.0,
                         help="Auto-encoding loss weight")
@@ -1178,8 +1175,8 @@ if __name__ == "__main__":
     
     src_sentences, tgt_sentences = load_nllb_multi_domain(
         dataset_config_name=args.dataset_config,
-        source_lang=args.source_lang,
-        target_lang=args.target_lang,
+        source_lang=args.src_lang_nllb,
+        target_lang=args.tgt_lang_nllb,
         split="train",
         max_samples=args.max_samples,
     )
@@ -1190,8 +1187,8 @@ if __name__ == "__main__":
         try:
             val_src_sentences, val_tgt_sentences = load_nllb_multi_domain(
                 dataset_config_name=args.dataset_config,
-                source_lang=args.source_lang,
-                target_lang=args.target_lang,
+                source_lang=args.src_lang_nllb,
+                target_lang=args.tgt_lang_nllb,
                 split="validation",
                 max_samples=args.max_val_samples,
             )
@@ -1204,8 +1201,8 @@ if __name__ == "__main__":
         try:
             test_src_sentences, test_tgt_sentences = load_nllb_multi_domain(
                 dataset_config_name=args.dataset_config,
-                source_lang=args.source_lang,
-                target_lang=args.target_lang,
+                source_lang=args.src_lang_nllb,
+                target_lang=args.tgt_lang_nllb,
                 split="test",
                 max_samples=args.max_test_samples,
             )
@@ -1213,8 +1210,8 @@ if __name__ == "__main__":
             print(f"Warning: Could not load test split: {e}")
     
     # Initialize trainer with auto-encoding, cross-domain, and adversarial components
-    trainer = AutoEncodingTrainer(
-        model_name="facebook/nllb-200-distilled-600m",
+    trainer = UMNMTTrainer(
+        model_name="facebook/nllb-200-distilled-1.3b",
         src_lang=args.src_lang_nllb,
         tgt_lang=args.tgt_lang_nllb,
         noise_pwd=args.noise_pwd,
