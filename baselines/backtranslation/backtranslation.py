@@ -9,7 +9,6 @@ The approach:
 2. Use a pretrained model to translate A → B (creates synthetic parallel data: A, B')
 3. Use a pretrained model to translate B → A (creates synthetic parallel data: A', B)
 4. Train on synthetic parallel data:
-   - Forward: A → B' teaches src→tgt direction
    - Backward: A' → B teaches tgt→src direction (backtranslation proper)
    
 In unsupervised setting:

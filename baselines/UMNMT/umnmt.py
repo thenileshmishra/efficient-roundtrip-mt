@@ -1,4 +1,6 @@
 """
+Implementation of the baseline from the paper: Unsupervised Machine Translation Using Monolingual Corpora Only by Lample et al. (2018).
+
 Denoising Auto-Encoding + Cross-Domain + Adversarial Training for Unsupervised NMT
 
 This script implements:
