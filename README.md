@@ -37,7 +37,7 @@ If you find this work useful, please cite:
 ```bibtex
 @misc{attia2026improvinglowresourcemachinetranslation,
       title={Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning}, 
-      author={Ahmed Attia and Alham Fikri},
+      author={Ahmed Attia and Alham Fikri Aji},
       year={2026},
       eprint={2601.12535},
       archivePrefix={arXiv},
