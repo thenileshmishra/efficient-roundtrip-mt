@@ -31,6 +31,8 @@ Training objective:
     L_disc = L_D (trained separately)
 """
 import copy
+import sys
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,7 +40,10 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from typing import List, Optional, Dict, Tuple
 from datasets import load_dataset
-import sacrebleu
+from sacrebleu.metrics import CHRF, BLEU
+
+# Add parent directory to path for imports when running as a script
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import noise_model_batch, generate_sequences
 
 class Discriminator(nn.Module):
@@ -768,7 +773,7 @@ class UMNMTTrainer:
         self,
         sentences: List[str],
         tgt_lang_id: int,
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 63,
     ) -> List[str]:
         """
         Translate a batch of sentences using greedy decoding.
@@ -790,7 +795,7 @@ class UMNMTTrainer:
             inputs,
             tgt_lang_id=tgt_lang_id,
             max_new_tokens=max_new_tokens,
-            gen_temperature=1.0,
+            gen_temperature=1.8,
             num_return_sequences=1,
             do_sample=False,  # Greedy decoding
         )
@@ -829,33 +834,30 @@ class UMNMTTrainer:
         tgt_to_src_translations = self.translate(
             tgt_sentences, self.src_lang_id
         )
-        
+        chrf_metric = CHRF(word_order=2, char_order=6)
+        bleu_metric = BLEU(tokenize="flores200")
         # Compute chrF++ for src → tgt
-        chrf_src_to_tgt = sacrebleu.corpus_chrf(
-            src_to_tgt_translations,
-            [tgt_sentences],
-            word_order=2,  # chrF++ uses word_order=2
+        chrf_src_to_tgt = chrf_metric.corpus_score(
+            hypotheses=src_to_tgt_translations,
+            references=[tgt_sentences],
         )
         
         # Compute chrF++ for tgt → src
-        chrf_tgt_to_src = sacrebleu.corpus_chrf(
-            tgt_to_src_translations,
-            [src_sentences],
-            word_order=2,
+        chrf_tgt_to_src = chrf_metric.corpus_score(
+            hypotheses=tgt_to_src_translations,
+            references=[src_sentences],
         )
         
         # Compute spBLEU for src → tgt (using flores200 tokenizer for NLLB)
-        bleu_src_to_tgt = sacrebleu.corpus_bleu(
-            src_to_tgt_translations,
-            [tgt_sentences],
-            tokenize="flores200",
+        bleu_src_to_tgt = bleu_metric.corpus_score(
+            hypotheses=src_to_tgt_translations,
+            references=[tgt_sentences],
         )
         
         # Compute spBLEU for tgt → src
-        bleu_tgt_to_src = sacrebleu.corpus_bleu(
-            tgt_to_src_translations,
-            [src_sentences],
-            tokenize="flores200",
+        bleu_tgt_to_src = bleu_metric.corpus_score(
+            hypotheses=tgt_to_src_translations,
+            references=[src_sentences],
         )
         
         return {
@@ -918,28 +920,25 @@ class UMNMTTrainer:
             all_tgt_to_src.extend(translations)
         
         # Compute corpus-level chrF++ and spBLEU
-        chrf_src_to_tgt = sacrebleu.corpus_chrf(
-            all_src_to_tgt,
-            [list(tgt_sentences)],
-            word_order=2,
+        chrf_metric = CHRF(word_order=2, char_order=6)
+        bleu_metric = BLEU(tokenize="flores200")
+        chrf_src_to_tgt = chrf_metric.corpus_score(
+            hypotheses=all_src_to_tgt,
+            references=[tgt_sentences],
+        )
+        chrf_tgt_to_src = chrf_metric.corpus_score(
+            hypotheses=all_tgt_to_src,
+            references=[src_sentences],
         )
         
-        chrf_tgt_to_src = sacrebleu.corpus_chrf(
-            all_tgt_to_src,
-            [list(src_sentences)],
-            word_order=2,
+        bleu_src_to_tgt = bleu_metric.corpus_score(
+            hypotheses=all_src_to_tgt,
+            references=[tgt_sentences],
         )
         
-        bleu_src_to_tgt = sacrebleu.corpus_bleu(
-            all_src_to_tgt,
-            [list(tgt_sentences)],
-            tokenize="flores200",
-        )
-        
-        bleu_tgt_to_src = sacrebleu.corpus_bleu(
-            all_tgt_to_src,
-            [list(src_sentences)],
-            tokenize="flores200",
+        bleu_tgt_to_src = bleu_metric.corpus_score(
+            hypotheses=all_tgt_to_src,
+            references=[src_sentences],
         )
         
         metrics = {
@@ -1213,7 +1212,7 @@ if __name__ == "__main__":
     
     # Initialize trainer with auto-encoding, cross-domain, and adversarial components
     trainer = UMNMTTrainer(
-        model_name="facebook/nllb-200-distilled-1.3b",
+        model_name="facebook/nllb-200-distilled-600M",
         src_lang=args.src_lang_nllb,
         tgt_lang=args.tgt_lang_nllb,
         noise_pwd=args.noise_pwd,

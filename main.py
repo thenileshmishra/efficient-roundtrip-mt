@@ -10,7 +10,6 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
 )
-from lora_utils import apply_lora
 from utils import (
     grpo_generate_sequences,
     grpo_compute_loss_and_logs,
