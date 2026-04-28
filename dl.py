@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, Sampler
-from torchdata.datapipes.map import MapDataPipe
+from torch.utils.data import Dataset as MapDataPipe
 from pytorch_lightning import LightningDataModule
 import warnings
 from datasets import load_dataset

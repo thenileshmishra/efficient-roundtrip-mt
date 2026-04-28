@@ -10,6 +10,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
 )
+from peft import LoraConfig, TaskType, get_peft_model
 from utils import (
     grpo_generate_sequences,
     grpo_compute_loss_and_logs,
@@ -513,6 +514,20 @@ def train(config: DictConfig):
 
 
 
+def apply_lora(model, target_modules, r=8, lora_alpha=32, lora_dropout=0.05):
+    lora_config = LoraConfig(
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        r=r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=list(target_modules),
+        bias="none",
+    )
+    peft_model = get_peft_model(model, lora_config)
+    adapted = [n for n, _ in peft_model.named_modules() if "lora_A" in n]
+    return peft_model, adapted
+
+
 def get_model(config: DictConfig):
     model_cfg = config.task.model
     tokenizer = AutoTokenizer.from_pretrained(
@@ -532,7 +547,7 @@ def get_model(config: DictConfig):
         if not target_modules:
             raise ValueError("LoRA target modules must be a non-empty sequence of module suffixes.")
 
-        replaced_modules = apply_lora(
+        model, replaced_modules = apply_lora(
             model=model,
             target_modules=target_modules,
             r=int(getattr(lora_cfg, "r", 8)),

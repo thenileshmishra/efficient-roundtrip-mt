@@ -17,3 +17,4 @@ seaborn
 nltk
 spacy
 sacrebleu
+peft
