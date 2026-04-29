@@ -7,8 +7,8 @@ data:
   dataset_config_name: "eng_Latn-rus_Cyrl"
 
 model:
-  name: "/workspace/thesis/src/model/facebook-nllb-200-distilled-600M_epoch_0_rus_Cyrl_chrf"
-  # name: "facebook/nllb-200-distilled-600M"
+  name: "facebook/nllb-200-distilled-600M"
+  # name: "/workspace/thesis/src/model/facebook-nllb-200-distilled-600M_epoch_0_rus_Cyrl_chrf"
   # name: /workspace/thesis/src/model/facebook-nllb-200-distilled-600M_epoch_2_wol_Latn
   # name: "facebook/nllb-200-3.3B"
   use_lora: false

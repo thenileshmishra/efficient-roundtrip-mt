@@ -32,8 +32,8 @@ DEVICE         = torch.device("cuda")
 CPU            = torch.device("cpu")
 DTYPE          = torch.bfloat16
 TRAIN_STEPS    = 20
-BATCH_SIZE     = 2
-NUM_SEQS       = 4
+BATCH_SIZE     = 1      # smaller to keep logits tensor (B*G*G × L × 256k) under ~200 MB
+NUM_SEQS       = 2      # forward candidates; backward batch = B*G=2, gen 2*2=4 seqs
 MAX_NEW_TOKENS = 63
 GEN_TEMP       = 1.8
 VAL_SAMPLES    = 50
@@ -282,18 +282,22 @@ if __name__ == "__main__":
         results.append(run(cfg, dm))
 
     # ── Final table ───────────────────────────────────────────────────────
+    # Full FT Adam optimizer states alone: 615M × 4 bytes × 2 (m+v) ≈ 4,900 MB
+    FULL_FT_THEORETICAL_MB = 1200 + 1200 + 4900  # model + grads + Adam
     ft = next((r for r in results if r["label"] == "Full FT"), None)
-    base_mem = ft["peak_mem_mb"] if ft and ft["peak_mem_mb"] else None
-    base_t   = ft["avg_step_s"]  if ft and ft["avg_step_s"]  else None
+    # Use theoretical estimate as baseline for % comparisons since Full FT OOMs
+    base_mem = FULL_FT_THEORETICAL_MB
+    base_t   = ft["avg_step_s"] if ft and ft["avg_step_s"] else None
 
     print("\n" + "="*88)
     print(f"{'Config':<12} {'Trainable%':>10} {'Peak MB':>9} {'Mem↓%':>7} "
           f"{'s/step':>8} {'Time↓%':>7} {'chrF pre':>9} {'chrF post':>10}")
     print("-"*88)
     for r in results:
-        mem_s  = f"{r['peak_mem_mb']:>9,.0f}" if r["peak_mem_mb"] else "     OOM"
+        mem_s  = (f"{r['peak_mem_mb']:>9,.0f}" if r["peak_mem_mb"]
+                  else f"~{FULL_FT_THEORETICAL_MB:>7,}*")
         mdrop  = (f"{(base_mem - r['peak_mem_mb'])/base_mem*100:>6.1f}%"
-                  if base_mem and r["peak_mem_mb"] else "      -")
+                  if r["peak_mem_mb"] else "   est")
         t_s    = f"{r['avg_step_s']:>8.2f}" if r["avg_step_s"] else "     OOM"
         tdrop  = (f"{(base_t - r['avg_step_s'])/base_t*100:>6.1f}%"
                   if base_t and r["avg_step_s"] else "      -")
