@@ -6,7 +6,7 @@ set -e
 
 # 1. Clone the repo (skip if already cloned)
 if [ ! -d "MT-via-Round-Trip-RL" ]; then
-  git clone https://github.com/YOUR_USERNAME/MT-via-Round-Trip-RL.git
+  git clone https://github.com/thenileshmishra/MT-via-Round-Trip-RL.git
 fi
 cd MT-via-Round-Trip-RL
 
